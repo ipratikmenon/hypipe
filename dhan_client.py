@@ -4,10 +4,12 @@ pandas DataFrame and provides simple order helpers.
 """
 
 import logging
+import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 
 import pandas as pd
+import requests
 from dhanhq import dhanhq
 
 from config import config
@@ -15,9 +17,17 @@ from config import config
 logger = logging.getLogger(__name__)
 
 
+_BASE = "https://api.dhan.co/v2"
+
+
 class DhanClient:
     def __init__(self):
         self._dhan = dhanhq(config.CLIENT_ID, config.ACCESS_TOKEN)
+        self._headers = {
+            "access-token": config.ACCESS_TOKEN,
+            "client-id": config.CLIENT_ID,
+            "Content-Type": "application/json",
+        }
 
     # ── Market data ────────────────────────────────────────────────────────
 
@@ -156,3 +166,58 @@ class DhanClient:
             if str(pos.get("securityId")) == str(security_id) and int(pos.get("netQty", 0)) != 0:
                 return pos
         return None
+
+    # ── Option chain ───────────────────────────────────────────────────────
+
+    def get_expiry_list(self, underlying_scrip: int, underlying_seg: str) -> list[str]:
+        """
+        Returns sorted list of expiry date strings (YYYY-MM-DD) for an underlying.
+        Dhan rate-limit: one unique request per 3 seconds per underlying/expiry pair.
+        """
+        resp = requests.post(
+            f"{_BASE}/optionchain/expirylist",
+            headers=self._headers,
+            json={"UnderlyingScrip": underlying_scrip, "UnderlyingSeg": underlying_seg},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        expiries = data.get("data", [])
+        return sorted(expiries)
+
+    def get_option_chain(
+        self, underlying_scrip: int, underlying_seg: str, expiry: str
+    ) -> dict:
+        """
+        Returns the full option chain dict keyed by strike price string.
+        Each value is {"ce": {...}, "pe": {...}} with fields:
+          security_id, last_price, top_bid_price, top_ask_price, oi, volume, iv, greeks
+        """
+        resp = requests.post(
+            f"{_BASE}/optionchain",
+            headers=self._headers,
+            json={
+                "UnderlyingScrip": underlying_scrip,
+                "UnderlyingSeg": underlying_seg,
+                "Expiry": expiry,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("data", {}).get("oc", {})
+
+    def get_ltp_bulk(self, securities: dict[str, list[str]]) -> dict[str, dict]:
+        """
+        Bulk LTP fetch — up to 1000 instruments per call.
+        securities: {"NSE_FNO": ["sec_id_1", "sec_id_2"], ...}
+        Returns: {"NSE_FNO": {"sec_id_1": {"last_price": 123.4}, ...}}
+        """
+        resp = requests.post(
+            f"{_BASE}/marketfeed/ltp",
+            headers=self._headers,
+            json=securities,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", {})
