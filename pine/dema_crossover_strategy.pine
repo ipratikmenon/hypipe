@@ -1,0 +1,95 @@
+// This Pine Script v5 strategy mirrors strategy.py / indicators.py exactly,
+// so the markers you see here are the same trades trader.py would take.
+//
+// Add it via: TradingView chart in Dhan → "fx" (Indicators) button →
+// Pine Editor → paste this code → Add to chart.
+//
+// Use the SAME chart timeframe as CANDLE_INTERVAL in your .env (default 2m).
+
+//@version=5
+strategy("Hypipe DEMA Crossover", overlay=true,
+     default_qty_type=strategy.cash, default_qty_value=100000,
+     pyramiding=0, calc_on_every_tick=false)
+
+// ── Inputs (keep in sync with config.py / .env) ─────────────────────────────
+fastLen        = input.int(10, "DEMA Fast", group="DEMA")
+slowLen        = input.int(20, "DEMA Slow", group="DEMA")
+trendLen       = input.int(95, "DEMA Trend", group="DEMA")
+
+maxLossPerUnit = input.float(500, "Max Loss per Trade (₹, underlying points)", group="Risk")
+targetMult     = input.float(2.0, "Profit Target Multiplier", group="Risk")
+touchTolPct    = input.float(0.3, "DEMA-Trend touch tolerance %", group="Risk") / 100
+
+sessionStr     = input.session("0915-1515", "Trading Session (IST)", group="Session")
+
+// ── DEMA calculation: 2*EMA(n) - EMA(EMA(n)) ───────────────────────────────
+dema(src, len) =>
+    e1 = ta.ema(src, len)
+    e2 = ta.ema(e1, len)
+    2 * e1 - e2
+
+demaFast  = dema(close, fastLen)
+demaSlow  = dema(close, slowLen)
+demaTrend = dema(close, trendLen)
+
+plot(demaFast,  "DEMA Fast",  color=color.new(color.aqua, 0),    linewidth=1)
+plot(demaSlow,  "DEMA Slow",  color=color.new(color.fuchsia, 0), linewidth=1)
+plot(demaTrend, "DEMA Trend", color=color.new(color.yellow, 0),  linewidth=2)
+
+// ── Crossover & trend filter ───────────────────────────────────────────────
+crossUp   = ta.crossover(demaFast, demaSlow)
+crossDown = ta.crossunder(demaFast, demaSlow)
+
+aboveTrend = close > demaTrend
+belowTrend = close < demaTrend
+
+// "Yellow line touches red candles" — low wicks into DEMA-Trend band
+touchTrend  = low <= demaTrend * (1 + touchTolPct) and low >= demaTrend * (1 - touchTolPct)
+prevTouch   = touchTrend[1]
+
+inSession = not na(time(timeframe.period, sessionStr))
+
+buySignal  = crossUp   and aboveTrend and inSession
+sellSignal = crossDown and belowTrend and inSession
+highConfBuy = buySignal and prevTouch
+
+// ── Entries ─────────────────────────────────────────────────────────────────
+if buySignal and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long)
+
+if sellSignal and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short)
+
+// ── Exits: SL / Target derived from MAX_LOSS_PER_TRADE, same as trader.py ──
+longSL      = strategy.position_avg_price - maxLossPerUnit
+longTarget  = strategy.position_avg_price + maxLossPerUnit * targetMult
+shortSL     = strategy.position_avg_price + maxLossPerUnit
+shortTarget = strategy.position_avg_price - maxLossPerUnit * targetMult
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop=longSL, limit=longTarget)
+    if crossDown
+        strategy.close("Long", comment="DEMA Cross Exit")
+
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop=shortSL, limit=shortTarget)
+    if crossUp
+        strategy.close("Short", comment="DEMA Cross Exit")
+
+// EOD square-off
+if not inSession and strategy.position_size != 0
+    strategy.close_all(comment="EOD")
+
+// ── Visual markers ──────────────────────────────────────────────────────────
+plotshape(buySignal and not highConfBuy, title="BUY", style=shape.triangleup,
+     location=location.belowbar, color=color.green, size=size.small, text="BUY")
+
+plotshape(highConfBuy, title="HIGH CONFIDENCE BUY", style=shape.triangleup,
+     location=location.belowbar, color=color.lime, size=size.normal, text="★ BUY")
+
+plotshape(sellSignal, title="SELL", style=shape.triangledown,
+     location=location.abovebar, color=color.red, size=size.small, text="SELL")
+
+// ── Alerts (for webhook → external automation, if your TradingView plan supports it) ──
+alertcondition(buySignal,  title="Hypipe BUY",  message='{"signal":"BUY","symbol":"{{ticker}}","price":{{close}}}')
+alertcondition(sellSignal, title="Hypipe SELL", message='{"signal":"SELL","symbol":"{{ticker}}","price":{{close}}}')
