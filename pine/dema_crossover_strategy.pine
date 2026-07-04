@@ -1,95 +1,135 @@
-// This Pine Script v5 strategy mirrors strategy.py / indicators.py exactly,
-// so the markers you see here are the same trades trader.py would take.
+// Hypipe DEMA Crossover Strategy — Pine Script v5
+// ===================================================
+// This script mirrors trader.py / strategy.py exactly so the BUY/SELL
+// markers you see here are the same signals the Python bot acts on.
 //
-// Add it via: TradingView chart in Dhan → "fx" (Indicators) button →
-// Pine Editor → paste this code → Add to chart.
+// TWO WAYS TO USE THIS
+// ──────────────────────────────────────────────────────────────────────
+// A) VISUAL ONLY (no TradingView plan needed)
+//    Open tradingview.com → Pine Editor → paste → Add to chart.
+//    Set the chart to the same timeframe as CANDLE_INTERVAL (default 2m).
+//    Markers appear automatically. Run trader.py separately.
 //
-// Use the SAME chart timeframe as CANDLE_INTERVAL in your .env (default 2m).
+// B) FULL AUTOMATION via Webhook (TradingView Pro+ required)
+//    1. Run webhook_server.py on a public IP / VPS
+//    2. Whitelist that server's IP on web.dhan.co (Profile → IP Whitelist)
+//    3. In TradingView, create an alert on this script
+//    4. Alert "Message" field → paste the JSON below for the condition
+//    5. Alert "Webhook URL" → https://<your-server>/alert
+//
+//    BUY alert message  (paste in TradingView alert for buySignal):
+//      {"signal":"BUY","option_type":"CE","index":"NIFTY","price":{{close}},"secret":"YOUR_WEBHOOK_SECRET"}
+//
+//    SELL alert message (paste in TradingView alert for sellSignal):
+//      {"signal":"SELL","option_type":"PE","index":"NIFTY","price":{{close}},"secret":"YOUR_WEBHOOK_SECRET"}
+//
+//    EXIT alert message (paste in TradingView alert for exitSignal):
+//      {"signal":"EXIT","price":{{close}},"secret":"YOUR_WEBHOOK_SECRET"}
+//
+//    Replace YOUR_WEBHOOK_SECRET with the value of WEBHOOK_SECRET in .env.
+//    Replace "NIFTY" with "BANKNIFTY", "MIDCPNIFTY", or "FINNIFTY" as needed.
+//    The webhook server will pick the best affordable option automatically.
+//
+// NOTE: tv.dhan.co (Dhan's hosted chart) does not support custom Pine Scripts.
+//       Use a separate tradingview.com account for this strategy.
 
 //@version=5
 strategy("Hypipe DEMA Crossover", overlay=true,
-     default_qty_type=strategy.cash, default_qty_value=100000,
-     pyramiding=0, calc_on_every_tick=false)
+         default_qty_type=strategy.cash, default_qty_value=100000,
+         pyramiding=0, calc_on_every_tick=false,
+         commission_type=strategy.commission.percent, commission_value=0.05)
 
-// ── Inputs (keep in sync with config.py / .env) ─────────────────────────────
-fastLen        = input.int(10, "DEMA Fast", group="DEMA")
-slowLen        = input.int(20, "DEMA Slow", group="DEMA")
-trendLen       = input.int(95, "DEMA Trend", group="DEMA")
+// ── Inputs ─────────────────────────────────────────────────────────────────
+var string GRP_DEMA    = "DEMA Settings"
+var string GRP_RISK    = "Risk / Budget"
+var string GRP_SESSION = "Session"
 
-maxLossPerUnit = input.float(500, "Max Loss per Trade (₹, underlying points)", group="Risk")
-targetMult     = input.float(2.0, "Profit Target Multiplier", group="Risk")
-touchTolPct    = input.float(0.3, "DEMA-Trend touch tolerance %", group="Risk") / 100
+fastLen        = input.int(10,   "DEMA Fast period",          group=GRP_DEMA)
+slowLen        = input.int(20,   "DEMA Slow period",          group=GRP_DEMA)
+trendLen       = input.int(95,   "DEMA Trend period",         group=GRP_DEMA)
+touchTolPct    = input.float(0.3,"DEMA-Trend touch tolerance %", group=GRP_DEMA, step=0.1) / 100
 
-sessionStr     = input.session("0915-1515", "Trading Session (IST)", group="Session")
+maxLossPoints  = input.float(500, "Max loss per trade (underlying points)", group=GRP_RISK)
+targetMult     = input.float(2.0, "Profit target multiplier",               group=GRP_RISK, step=0.5)
 
-// ── DEMA calculation: 2*EMA(n) - EMA(EMA(n)) ───────────────────────────────
+sessionStr     = input.session("0915-1515", "Trading session (IST)", group=GRP_SESSION)
+
+// ── DEMA: 2×EMA(n) − EMA(EMA(n)) — same formula as indicators.py ──────────
 dema(src, len) =>
     e1 = ta.ema(src, len)
-    e2 = ta.ema(e1, len)
-    2 * e1 - e2
+    2.0 * e1 - ta.ema(e1, len)
 
 demaFast  = dema(close, fastLen)
 demaSlow  = dema(close, slowLen)
 demaTrend = dema(close, trendLen)
 
-plot(demaFast,  "DEMA Fast",  color=color.new(color.aqua, 0),    linewidth=1)
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(demaFast,  "DEMA Fast",  color=color.new(color.aqua,    0), linewidth=1)
 plot(demaSlow,  "DEMA Slow",  color=color.new(color.fuchsia, 0), linewidth=1)
-plot(demaTrend, "DEMA Trend", color=color.new(color.yellow, 0),  linewidth=2)
+plot(demaTrend, "DEMA Trend", color=color.new(color.yellow,  0), linewidth=2)
 
-// ── Crossover & trend filter ───────────────────────────────────────────────
-crossUp   = ta.crossover(demaFast, demaSlow)
+// ── Signal conditions (identical to strategy.py DEMACrossoverStrategy) ──────
+crossUp   = ta.crossover(demaFast,  demaSlow)
 crossDown = ta.crossunder(demaFast, demaSlow)
 
 aboveTrend = close > demaTrend
 belowTrend = close < demaTrend
 
-// "Yellow line touches red candles" — low wicks into DEMA-Trend band
-touchTrend  = low <= demaTrend * (1 + touchTolPct) and low >= demaTrend * (1 - touchTolPct)
-prevTouch   = touchTrend[1]
+// "Yellow line touches red candles" — low wick grazes the DEMA-Trend band
+touchTrend = low <= demaTrend * (1.0 + touchTolPct) and
+             low >= demaTrend * (1.0 - touchTolPct)
 
 inSession = not na(time(timeframe.period, sessionStr))
 
-buySignal  = crossUp   and aboveTrend and inSession
-sellSignal = crossDown and belowTrend and inSession
-highConfBuy = buySignal and prevTouch
+buySignal     = crossUp   and aboveTrend and inSession
+sellSignal    = crossDown and belowTrend and inSession
+exitLong      = crossDown and inSession
+exitShort     = crossUp   and inSession
+highConfBuy   = buySignal and touchTrend[1]   // prev candle touched DEMA-95
 
-// ── Entries ─────────────────────────────────────────────────────────────────
+// ── Strategy entries / exits ────────────────────────────────────────────────
 if buySignal and strategy.position_size <= 0
     strategy.entry("Long", strategy.long)
 
 if sellSignal and strategy.position_size >= 0
     strategy.entry("Short", strategy.short)
 
-// ── Exits: SL / Target derived from MAX_LOSS_PER_TRADE, same as trader.py ──
-longSL      = strategy.position_avg_price - maxLossPerUnit
-longTarget  = strategy.position_avg_price + maxLossPerUnit * targetMult
-shortSL     = strategy.position_avg_price + maxLossPerUnit
-shortTarget = strategy.position_avg_price - maxLossPerUnit * targetMult
+longSL     = strategy.position_avg_price - maxLossPoints
+longTarget = strategy.position_avg_price + maxLossPoints * targetMult
+shortSL    = strategy.position_avg_price + maxLossPoints
+shortTarget= strategy.position_avg_price - maxLossPoints * targetMult
 
 if strategy.position_size > 0
     strategy.exit("Long Exit", "Long", stop=longSL, limit=longTarget)
     if crossDown
-        strategy.close("Long", comment="DEMA Cross Exit")
+        strategy.close("Long", comment="Cross Exit")
 
 if strategy.position_size < 0
     strategy.exit("Short Exit", "Short", stop=shortSL, limit=shortTarget)
     if crossUp
-        strategy.close("Short", comment="DEMA Cross Exit")
+        strategy.close("Short", comment="Cross Exit")
 
-// EOD square-off
 if not inSession and strategy.position_size != 0
     strategy.close_all(comment="EOD")
 
-// ── Visual markers ──────────────────────────────────────────────────────────
-plotshape(buySignal and not highConfBuy, title="BUY", style=shape.triangleup,
-     location=location.belowbar, color=color.green, size=size.small, text="BUY")
+// ── Visual signal markers ───────────────────────────────────────────────────
+plotshape(buySignal and not highConfBuy,
+         title="BUY", style=shape.triangleup, location=location.belowbar,
+         color=color.green, size=size.small, text="BUY")
 
-plotshape(highConfBuy, title="HIGH CONFIDENCE BUY", style=shape.triangleup,
-     location=location.belowbar, color=color.lime, size=size.normal, text="★ BUY")
+plotshape(highConfBuy,
+         title="★ HIGH CONF BUY", style=shape.triangleup, location=location.belowbar,
+         color=color.lime, size=size.normal, text="★BUY")
 
-plotshape(sellSignal, title="SELL", style=shape.triangledown,
-     location=location.abovebar, color=color.red, size=size.small, text="SELL")
+plotshape(sellSignal,
+         title="SELL", style=shape.triangledown, location=location.abovebar,
+         color=color.red, size=size.small, text="SELL")
 
-// ── Alerts (for webhook → external automation, if your TradingView plan supports it) ──
-alertcondition(buySignal,  title="Hypipe BUY",  message='{"signal":"BUY","symbol":"{{ticker}}","price":{{close}}}')
-alertcondition(sellSignal, title="Hypipe SELL", message='{"signal":"SELL","symbol":"{{ticker}}","price":{{close}}}')
+// ── Alert conditions (used with TradingView webhook alerts) ─────────────────
+// When creating the alert, select the condition, then paste the JSON above
+// into the "Message" field and your webhook_server URL into "Webhook URL".
+alertcondition(buySignal,   title="Hypipe BUY  → webhook_server",  message="BUY signal fired — set message JSON in alert dialog")
+alertcondition(sellSignal,  title="Hypipe SELL → webhook_server",  message="SELL signal fired — set message JSON in alert dialog")
+alertcondition(exitLong,    title="Hypipe EXIT LONG",              message="EXIT signal fired — set message JSON in alert dialog")
+alertcondition(exitShort,   title="Hypipe EXIT SHORT",             message="EXIT signal fired — set message JSON in alert dialog")
+alertcondition(highConfBuy, title="Hypipe HIGH CONFIDENCE BUY",   message="HIGH CONF BUY — set message JSON in alert dialog")

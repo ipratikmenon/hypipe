@@ -41,6 +41,11 @@ class Config:
     DEMA_SLOW: int = int(os.getenv("DEMA_SLOW", "20"))
     DEMA_TREND: int = int(os.getenv("DEMA_TREND", "95"))
 
+    # Webhook server
+    WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
+    WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")
+    WEBHOOK_PORT: int = int(os.getenv("WEBHOOK_PORT", "8000"))
+
     # Timing (IST 24h)
     TIMEZONE: str = os.getenv("TIMEZONE", "Asia/Kolkata")
     MARKET_OPEN: str = os.getenv("MARKET_OPEN", "09:15")
