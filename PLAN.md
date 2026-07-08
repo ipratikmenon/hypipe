@@ -237,11 +237,14 @@ In parallel, `indices/` hardening phases R1–R4 can proceed independently.
 
 ---
 
-## Decision points for the user
+## Decision points — RESOLVED (2026-07-08)
 
-1. **Cross pairs vs INR pairs** — trade thin EURUSD/GBPUSD/USDJPY futures on NSE, or
-   the liquid INR pairs as USD-flow proxies? (Plan: measure spreads first, decide with data.)
-2. **MCX contract size** — GOLD (1 kg, ~₹7 L margin) vs GOLDM mini (100 g)? Mini
-   contracts fit a smaller risk budget.
-3. **Capital allocation** per module (`indices/` vs `fx_commodities/`) for the
-   portfolio-level daily-loss limit.
+1. **Cross pairs vs INR pairs** — record both during Phase 1, measure spreads,
+   let data decide the tradeable universe. ✔ approved
+2. **MCX contract size** — mini contracts (GOLDM, SILVERM, CRUDEOILM). ✔ approved
+3. **Capital allocation** — configurable split, default 50/50 between modules;
+   all `fx_commodities/` risk limits derive from its slice. ✔ approved
+
+The full implementation brief lives at
+[`fx_commodities/REQUIREMENTS.md`](fx_commodities/REQUIREMENTS.md) — written to be
+buildable by an engineer or AI model with no other context.
