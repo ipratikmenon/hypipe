@@ -236,6 +236,40 @@ fails fast listing near-miss candidates (`mt5.symbols_get("*EURUSD*")`).
   the probe must detect `symbol_info.expiration_time ≠ 0` and the resolver then
   applies the v1 rollover rule (flatten 2 days before expiry).
 
+### 2.4 Crypto universe (added per user decision, 2026-07-08)
+
+| Key | Class | Venue (data + execution) | Notes |
+|-----|-------|--------------------------|-------|
+| BTCUSD | Crypto | Binance/Bybit spot or USDT-perp | deepest book on earth |
+| ETHUSD | Crypto | Binance/Bybit spot or USDT-perp | |
+| SOLUSD (optional) | Crypto | Binance/Bybit | enable after BTC/ETH prove out |
+
+**Why crypto strengthens the whole system:** unlike retail FX feeds, crypto
+exchanges publish EVERYTHING free over public websockets — full L2 order book,
+every trade with aggressor side, real volume, open interest, funding, and
+liquidations. Crypto symbols are therefore **T1 + T2 natively**: true CVD,
+footprints, DOM heatmaps, iceberg detection all work from day one, and GEX
+comes from Deribit's options API. Crypto is where the §7 feature set runs at
+full strength — treat it as the reference asset class for validating the
+orderflow features that FX can only partially express.
+
+Implementation requirements:
+- **`broker/crypto_adapter.py`** implementing the same `BrokerAdapter`
+  Protocol (§4.2) — this is exactly what the abstraction was built for.
+  Data: native exchange websockets (trade + depth streams). Execution: the
+  exchange REST API (or ccxt for venue portability). Runs on Linux — no MT5
+  terminal needed for the crypto slice.
+- Sessions: 24/7 — no square-off; funding timestamps (every 8 h on most
+  perps) replace the swap-avoidance logic; `funding_rate` joins §7.8 features.
+- Risk: crypto ATR is proportionally much larger — the ATR-based barrier and
+  sizing math (§8.1, §9.3) needs NO changes (that is the point of
+  volatility-normalized design), but `MAX_LOTS`-equivalent is quote-quantity
+  based, and the correlation guard treats BTC/ETH as one group (ρ ≈ 0.8) and
+  as half-weight members of the short-USD group.
+- Weekend risk: crypto trades while FX/MCX are closed. Daily-loss accounting
+  runs on UTC days uniformly — weekend crypto losses count against the UTC day
+  they occur and halt crypto entries for that day, exactly as on weekdays.
+
 ### 2.3 Sessions & timing
 
 - FX/metals trade ~24/5: Monday 00:05 → Friday 23:50 **server time**. All
@@ -509,9 +543,69 @@ Zone strength = number of independent sources within w/2 of the center + count
 of prior confirmed holds; a zone whose violation close occurs (see §9.1b) is
 marked broken and flips role (broken support → resistance candidate).
 
+### 7.7 Large-participant footprints (`features/footprints.py`) — T1/T2
+
+**Honest framing first:** orderflow does not *predict* when a large firm will
+decide to move a market — institutions split orders through TWAP/VWAP/iceberg
+algos precisely to stay invisible, and actual manipulation is illegal and rare
+relative to legitimate large-order execution. What orderflow CAN do is *detect
+the footprints of large executions already in progress*, which lag intent by
+seconds-to-minutes but still lead price on our bar horizon. Detectable
+signatures, each a feature:
+
+- **Absorption (T1, already §7.1):** heavy aggressive selling into a level
+  that refuses to drop — a large passive buyer. The single most reliable
+  footprint.
+- **Iceberg detection (T2):** a DOM level that repeatedly refills after being
+  consumed. Feature: `iceberg_score` = refill count × refill size at the
+  most-refilled level within k ticks of price, over the last N bars.
+- **Sweep detection (T1):** a single aggressive burst consuming ≥ 3 price
+  levels within one bar (`max_levels_swept`, `sweep_volume_z`). Sweeps mark
+  urgency — someone paying up for immediacy.
+- **Spoof/pull patterns (T2, extends §7.3 pull/stack):** large resting size
+  that appears and is pulled without ever trading, repeatedly, on one side —
+  `phantom_liquidity_score`. Treat as *distrust that side's depth*, never as a
+  directional signal alone.
+- **CVD/price divergence at zones (T1):** rising CVD while price is capped at
+  resistance = absorption by a seller; the reverse at support. Exported as
+  `zone_absorption_divergence` and consumed by the confirmation gate (§9.1b
+  amendment below).
+
+### 7.8 Positioning & sentiment layer (`features/positioning.py`)
+
+Slow-moving "who is positioned where" context — weekly/daily cadence, joined
+onto bars as forward-filled daily features:
+
+- **COT (CFTC Commitments of Traders):** free weekly CSV from cftc.gov
+  (published Friday, data as-of Tuesday — join with a 3-day lag, NEVER as-of
+  the data date: lookahead). Map: EURUSD→EC, GBPUSD→BP, USDJPY→JY,
+  XAUUSD→GC, XAGUSD→SI, WTI→CL, NATGAS→NG, COPPER→HG, BTC→CME BTC futures.
+  Features per symbol: `cot_noncomm_net_pctile` (3-year percentile of
+  non-commercial net position), `cot_net_delta_4w`. Extremes (>90th / <10th
+  percentile) are contrarian context, not timing signals.
+- **Gamma exposure (GEX):** dealer gamma from options OI:
+  `GEX = Σ_strikes OI × gamma × contract_multiplier × spot²` (calls +, puts −
+  under standard dealer-positioning assumptions). Availability is the
+  constraint: ✔ crypto via Deribit's public options API (BTC/ETH — full chain
+  with greeks); ✔ Indian indices via the Dhan option-chain API (the indices/
+  module already fetches this chain — reuse); ✘ NOT computable for spot FX /
+  MCX via MT5 (no options chain). Features where available: `gex_total`,
+  `gex_flip_level` (spot where net gamma crosses zero), `dist_to_gex_flip_atr`,
+  `dist_to_max_pain_atr`. Positive dealer gamma ⇒ mean-reversion regime
+  (dealers fade moves); negative ⇒ amplification regime — this composes
+  directly with the §8.3 HMM as a regime prior.
+- **Crypto sentiment (crypto only):** perp `funding_rate` and its z-score
+  (persistent positive funding = crowded longs), `oi_change_pct`,
+  `liquidation_volume_z` from exchange liquidation feeds — cascade detection.
+
+Feature availability matrix (extends §7.0): `positioning` features are daily
+tier-D columns, present per symbol per the table above; absent columns are
+never imputed.
+
 **No-lookahead rule and test apply to every feature exactly as v1:** value at
 bar *t* uses only `ts < t.close`; `tests/test_no_lookahead.py` truncates input
-and asserts unchanged earlier values.
+and asserts unchanged earlier values. For weekly/daily joined data (COT, GEX)
+the rule extends to *publication* time, not measurement time.
 
 ---
 
@@ -805,6 +899,14 @@ touch, BOTH the hypothetical at-touch outcome and the confirmed-entry outcome
 and `confirmation_value = Δp·(π+σ) − δ` per symbol. If confirmation_value ≤ 0
 on a symbol, the gate is disabled there — the math decides, not preference.
 
+**Orderflow-coupled confirmation (T1 symbols, config `CONFIRM_REQUIRE_CVD`):**
+where true aggressor data exists, a confirming close additionally requires CVD
+agreement over the confirmation bars — for a support hold, bar-delta sum ≥ 0
+(sellers hit the zone and were absorbed, §7.7). Price closing back above a
+zone on *falling* CVD is a weaker hold; requiring the CVD term measurably
+raises p₁ on T1 symbols or the config stays off — same evidence standard as
+the gate itself (the confirmation_study reports both variants).
+
 **Global closed-bar rule (applies to every entry path, §10.1 amended):**
 signals are evaluated ONLY on completed bars; fills occur at the next bar's
 open plus slippage. The engine and the live trader share this rule so backtest
@@ -1065,6 +1167,31 @@ with mocked `order_send`.
 5. Weekly: review `reports/` walk-forward drift; monthly: retrain schedule.
 
 ---
+
+## 15b. Relationship to NautilusTrader (and similar platforms)
+
+Recurring question, answered here for the record. **NautilusTrader is not a
+competitor to our model — it is a competitor to our *engine*.** It is an
+open-source, Rust-core, event-driven trading platform: nanosecond-precision
+backtesting, live/backtest code parity, and production adapters for many
+venues (Binance, Bybit, Interactive Brokers, …). It ships **zero alpha**: no
+features, no prediction, no edge — you bring the strategy, it runs it.
+
+| Dimension | This repo's engine | NautilusTrader |
+|---|---|---|
+| Prediction/alpha | §7–§9 (the actual edge) | none — bring your own |
+| Backtest granularity | bar-level + recorded-spread costs | tick/order-book level |
+| Live/backtest parity | shared decide()/size(), closed-bar rule | first-class, battle-tested |
+| Venue adapters | MT5 (ours), crypto (planned) | many, maintained by community |
+| Complexity | ~600 lines, fully understood | large framework, steep curve |
+
+Position: our *edge* lives in features + model + gates, which port anywhere.
+The pragmatic path is to keep our lean engine through Phase 3 validation, and
+**adopt NautilusTrader as the execution/backtest backbone for the crypto slice
+in Phase 4+ if tick-level fidelity starts to matter** — its Binance/Bybit
+adapters would replace `crypto_adapter.py` execution while our `BrokerAdapter`
+seam keeps strategy code unchanged. Migrating before the model is validated
+would be infrastructure procrastination.
 
 ## 16. Explicitly out of scope (v1)
 
