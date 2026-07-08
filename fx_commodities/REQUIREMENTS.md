@@ -43,6 +43,35 @@ strict risk controls.
 | D2 | Small-account sizing: volumes in **fractional lots**, min 0.01, always respecting `volume_min/step/max` from `symbol_info`. |
 | D3 | Capital split with `indices/` stays: `ALLOC_FX_COMMODITIES` (default 0.50) of `CAPITAL_TOTAL`. All module risk limits derive from that slice. |
 | D4 | Broker abstraction is mandatory: strategy/risk code may import **only** `broker/base.py` types, never `MetaTrader5` directly. |
+| D5 | **Operating profile: low capital, high win rate, 1–2 trades/day.** See §0.5 — this profile is encoded as the default configuration. |
+
+### 0.5 Operating profile — the high-win-rate parameterization (D5)
+
+The user's target is an ~85% win rate at 1–2 trades per day on a small account.
+Honest math first: **no directional edge supports 85% wins at 2:1 reward:risk**
+(that would imply E[R] ≈ +1.4 ATR/trade — nobody has that). A high win rate is
+*bought* by inverting the barrier geometry and being extremely selective:
+
+- **Asymmetric barriers:** `PT_MULT=0.8, SL_MULT=1.6` (target 0.5× the stop).
+  Breakeven from §8.0 with typical cost `c≈0.15 ATR`:
+  `p* = (1.6 + 0.15)/(0.8 + 1.6) ≈ 0.73`. At the target operating point
+  `p̂ = 0.85`: `E[R] = 0.85·0.8 − 0.15·1.6 − 0.15 ≈ +0.29 ATR/trade` — a real,
+  positive expectancy with a win rate that high thresholds can plausibly reach,
+  because the market only has to *not fall 1.6 ATR* before rising 0.8 ATR.
+- **Selectivity produces the 1–2 trades/day, not a scheduler:** `EDGE_MARGIN=0.07`
+  (trade only at `p̂ ≥ p* + 0.07 ≈ 0.80`), `CONFORMAL_EPS=0.15` (tighter
+  abstention), plus a hard `MAX_TRADES_PER_DAY=2` cap as a backstop. If the
+  thresholds only yield one trade some days, that is correct behaviour — do
+  not loosen them to hit a quota.
+- **Risk asymmetry warning (encode in the runbook):** with SL = 2× TP, the rare
+  loss erases ~2.3 wins. At 85% wins the math works; at 75% it breaks even
+  before costs. The walk-forward gate must therefore verify the *realized* win
+  rate matches the calibrated probabilities (ECE < 0.05 already enforces this).
+- **Low capital:** fractional lots make this viable from ~$500–1000 account
+  equity: `RISK_PER_TRADE_PCT=1.0` (small accounts can run 1% — the daily cap
+  still limits to 2 trades), 0.01-lot minimum sizing rules of §9.3 apply
+  unchanged. Expectation management: at 0.29 ATR/trade × 1–2 trades/day the
+  account grows steadily, not explosively; leverage is NOT the lever to pull.
 
 ### 0.4 Hard constraints for the implementer
 
