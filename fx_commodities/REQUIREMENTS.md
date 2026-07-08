@@ -820,6 +820,82 @@ matches reality:
 
 ---
 
+### 8.11 Advanced detection & GPU research track (Phase 5+, prioritized)
+
+What is worth adding beyond §7–§8, in priority order, with the promotion rule
+that governs all of it: **a candidate model/feature ships only if it beats the
+incumbent out-of-sample under the same purged walk-forward + PSR protocol.**
+Trial counts feed the §10.3 DSR accounting — GPU compute makes it easy to run
+thousands of experiments, which makes overfitting-by-search the #1 risk.
+
+**R1. Economic-calendar blackout (trivial, immediate).** No entries within
+±N minutes of scheduled high-impact events (NFP, CPI, FOMC, ECB/BoJ; crypto:
+FOMC + large token unlocks). Quant desks gate releases as a matter of course;
+for a high-win-rate profile this is pure win-rate defence. Data: any free
+economic-calendar API, cached daily. Config: `NEWS_BLACKOUT_MIN=30`.
+
+**R2. Flow toxicity — VPIN (Easley, López de Prado, O'Hara).** Bucket volume
+into equal-volume bins, estimate per-bin signed imbalance, then
+`VPIN = Σ|V_buy − V_sell| / (n·V_bucket)` over a rolling window. High VPIN =
+informed flow is picking off liquidity providers → spreads about to widen,
+regime fragile. Needs real volume: crypto/T1 only. Join the §9.2 regime guard.
+
+**R3. Hawkes-process endogeneity.** Order/trade arrivals as a self-exciting
+point process `λ(t) = μ + Σ_{t_i<t} α·e^{−β(t−t_i)}`; the branching ratio
+`n = α/β` measures reflexivity — how much activity is triggered by other
+activity rather than news (Filimonov & Sornette). `n → 1` marks fragile,
+cascade-prone markets (flash-crash precursor); also the cleanest available
+*mathematical* answer to "can we see large-player cascades coming": we can
+see when the market is primed for one. Fit by MLE per session, T1+.
+
+**R4. Cross-asset lead-lag.** DXY→gold/EURUSD, ES futures→BTC (US hours),
+BTC→ETH→alts. Estimate with the Hayashi–Yoshida covariance estimator (handles
+asynchronous ticks) at lags 0–60 s; trade the laggard on the leader's
+confirmed move only where lag correlation is stable out-of-sample. This is a
+genuine, documented micro-inefficiency in crypto.
+
+**R5. Mean-reversion pair module.** ETH/BTC spread first: fit an
+Ornstein–Uhlenbeck process `dX = θ(μ−X)dt + σdW`; trade z-score extremes only
+when the estimated half-life `ln2/θ` is short and stable. Johansen test for
+cointegration re-checked at every walk-forward boundary — pairs die.
+
+**R6. Deep learning on the order book (the GPU track).** The one DL
+architecture family with replicated results in this domain: DeepLOB-style
+CNNs/CNN-LSTMs on stacked L2 snapshots (Zhang, Zohren, Roberts 2019) for
+short-horizon direction. Recipe: inputs = last 100 book states × 20 levels
+(price, size both sides), labels = §8.1 triple-barrier, training = purged
+walk-forward identical to LightGBM. Crypto only (needs full L2 history — our
+recorder provides it). Runs comfortably on one 24 GB consumer GPU (RTX
+4090-class): days of training data ≈ minutes/epoch. Serving: at 1-min bars,
+live inference latency is a non-issue — run the torch model directly.
+Promotion gate: must beat the calibrated LightGBM meta-stack OOS by ≥ 2 pts of
+precision at equal recall, else it stays a research artifact.
+
+**R7. Alpha mining with strict accounting (optional).** Genetic
+programming / formulaic alpha search (à la WorldQuant's alpha101) over the
+feature set. Permitted ONLY with automatic trial logging into
+`reports/trials.json` — mined alphas are DSR-discounted by construction.
+
+**R8. Reinforcement learning — execution only.** The honest read of the
+literature and industry practice: RL is productive for *order execution*
+(when to cross the spread, order sizing/segmentation — cf. optimal execution
+frameworks) and unstable for signal generation. If we ever do RL, it
+optimizes fill quality against recorded books, never entry/exit decisions.
+
+**Explicitly not pursued (out of a single-operator's reach, stated so the
+roadmap stays honest):** colocation/FPGA latency arbitrage, queue-position
+games, maker-rebate harvesting, index-rebalance front-running at size. These
+are the profitable things HFT firms do that no retail setup can replicate —
+our edge must come from horizon (minutes, not microseconds), discipline
+(gates), and data breadth (crypto L2 + positioning), not speed.
+
+**Local GPU training stack (reference):** PyTorch + CUDA on Linux; polars +
+DuckDB over the Parquet lake (columnar scans of tick data); Optuna for HPO
+inside purged CV; MLflow (local) for experiment tracking; every experiment id
+increments the DSR trial counter. A single consumer GPU is sufficient for
+everything in R6; multi-GPU adds nothing until the dataset spans years of
+multi-venue L2.
+
 ## 9. Ensemble, risk, and signal output
 
 ### 9.1 Decision logic (`model/ensemble.py`)
