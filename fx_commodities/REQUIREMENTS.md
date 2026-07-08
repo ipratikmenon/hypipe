@@ -255,11 +255,17 @@ fx_commodities/
 │   ├── heatmap.py           # DOM heatmap, only where has_dom (§7.3)
 │   ├── volume_profile.py    # POC/VAH/VAL, VWAP on tick_volume (§7.4)
 │   └── indicators.py        # DEMA, ATR, ADX, Hurst, Yang-Zhang (§7.5)
-├── model/                   # unchanged in structure from v1
-│   ├── labeling.py          # triple-barrier (§8.1)
-│   ├── dataset.py           # purged CV assembly (§8.2)
-│   ├── train.py             # LightGBM + isotonic (§8.3)
-│   ├── kalman.py            # trend filter (§8.4)
+├── model/
+│   ├── labeling.py          # triple-barrier + cost-aware breakeven (§8.1)
+│   ├── har.py               # HAR-RV volatility forecaster (§8.2)
+│   ├── regime.py            # Gaussian HMM + variance-ratio (§8.3)
+│   ├── frac_diff.py         # fractional differentiation (§8.4)
+│   ├── dataset.py           # purged CV + uniqueness weights (§8.5)
+│   ├── train.py             # primary LightGBM (§8.6)
+│   ├── meta.py              # meta-labeling secondary model (§8.7)
+│   ├── conformal.py         # split-conformal abstention (§8.8)
+│   ├── kalman.py            # trend filter (§8.9)
+│   ├── drift.py             # PSI/KS live drift monitor (§8.10)
 │   └── ensemble.py          # decision logic (§9.1)
 ├── backtest/
 │   ├── engine.py            # event-driven engine (§10.1)
@@ -461,29 +467,214 @@ and asserts unchanged earlier values.
 
 ---
 
-## 8. Model layer (largely unchanged from v1)
+## 8. Model layer — the mathematical prediction framework
 
-### 8.1 Triple-barrier labeling
-Upper `close + PT_MULT×ATR` (2.0), lower `close − SL_MULT×ATR` (1.0), vertical
-`MAX_HOLD_BARS` (60). `y ∈ {+1, −1, 0}`, record `t_touch`.
+### 8.0 First principles: what is actually predictable, and the trade inequality
 
-### 8.2 Dataset
-Per-symbol matrices with tier-gated columns (§7.0) + symbol one-hot for pooled
-training. **Purged K-fold with embargo** (`EMBARGO_PCT=0.01`) exactly as v1 —
-overlapping-label leakage control is mandatory. Persist with `dataset_version`
-hash of (features, tiers, label params, date range).
+Everything in this section follows from one honest premise: **short-horizon
+price *direction* in liquid markets is only weakly predictable** (correctly
+calibrated edges of 2–8 percentage points over base rate, decaying over time),
+while **volatility is strongly predictable** and **regime is moderately
+predictable**. The architecture therefore does not try to be a crystal ball; it
+(a) forecasts volatility well, (b) conditions a weak directional edge on regime
+and orderflow, (c) bets only when the *net-of-costs* inequality below holds, and
+(d) sizes bets by the magnitude of the edge.
 
-### 8.3 Training
-LightGBM (`num_leaves=31, max_depth=6, lr=0.05, n_estimators=400,
-min_child_samples=100, subsample=0.8, colsample_bytree=0.8`), tuned only via
-purged CV; isotonic calibration on a held-out fold; persist
-`models/{scope}/{dataset_version}/model.joblib` + `metrics.json` + feature-gain
-report (alert if one feature > 40% gain — leakage smell).
+**The trade inequality.** A trade with profit target `π·ATR`, stop `σ·ATR`,
+round-trip cost `c` (in ATR units: `(spread + commission + slippage) / ATR`),
+and true success probability `p` has expectancy
 
-### 8.4 Kalman trend filter
-Local linear trend `[level, velocity]`, `F=[[1,1],[0,1]]`, `H=[1,0]`,
-`KALMAN_Q=1e-5, KALMAN_R=1e-2` per-symbol overridable. Outputs `kf_level,
-kf_velocity, kf_velocity_z`; used as features and for trailing stops.
+```
+E[R] = p·π − (1−p)·σ − c        (in ATR units)
+```
+
+which is positive iff
+
+```
+p  >  p*  =  (σ + c) / (π + σ)
+```
+
+With the defaults `π=2, σ=1` and a typical `c≈0.15`: `p* ≈ 0.383`. **`p*` is
+computed live per symbol from current ATR and recorded costs** — it replaces the
+fixed `P_ENTRY` constant. The entry condition everywhere in §9 is
+`p̂ ≥ p* + EDGE_MARGIN` (default margin 0.05). This single change makes every
+threshold cost-aware: when spreads widen, `p*` rises and the system automatically
+demands more evidence.
+
+All models below output *calibrated probabilities* so this inequality is
+meaningful; an uncalibrated 0.65 is worthless.
+
+### 8.1 Triple-barrier labeling (`model/labeling.py`)
+
+Upper barrier `close + π·ATR_t`, lower `close − σ·ATR_t`, vertical
+`MAX_HOLD_BARS` (60). `y ∈ {+1, −1, 0}`, record `t_touch` (needed for purging
+and uniqueness weights). ATR here is the **HAR-adjusted ATR** of §8.2 —
+barriers scale with *forecast* volatility, not just trailing volatility, so
+labels mean the same thing in quiet and violent sessions.
+
+Also store per event: entry cost `c_t` in ATR units (from live spread at t) —
+used to compute realized `p*_t` per sample so training-time and trade-time
+thresholds agree.
+
+### 8.2 Volatility layer — HAR-RV (`model/har.py`)
+
+The single most predictable market quantity. Realized variance from 1-minute
+mid-price log returns within bar aggregation windows:
+
+```
+RV_t(day)  = Σ_i r_i²          (r_i = 1-min log returns of day t)
+HAR:  RV_{t+1} = β₀ + β_d·RV_t + β_w·(1/5)Σ_{j=0..4} RV_{t−j}
+                + β_m·(1/22)Σ_{j=0..21} RV_{t−j} + ε
+```
+
+- Fit by OLS on log(RV) (log stabilizes heteroskedasticity), per symbol,
+  refit weekly on a 250-day rolling window. Intraday version: same structure on
+  30-minute RV buckets with daily/weekly components for hour-ahead forecasts.
+- Outputs, exported as features **and** consumed by other layers:
+  `rv_forecast_1d`, `rv_forecast_1h`, `vol_surprise = RV_realized/RV_forecast`
+  (values ≫ 1 mean the market is doing something the vol model didn't expect —
+  a regime-change early warning), `har_atr = √(rv_forecast_1h) × scaling` used
+  for barrier placement (§8.1) and sizing denominator (§9.3).
+- Acceptance test: HAR out-of-sample R² on log RV must exceed a random-walk
+  RV forecast (R² > 0.3 is typical for FX; if not, check the RV computation).
+
+### 8.3 Regime layer — Gaussian HMM + variance-ratio (`model/regime.py`)
+
+Markets alternate between persistent regimes (trend / chop / crisis) and the
+optimal behaviour differs per regime. Two complementary detectors:
+
+**(a) 3-state Gaussian HMM** on observation vector `x_t = [r_t, log RV_t]`
+(bar log-return, log realized variance):
+
+```
+P(x_t | s_t = k) = N(μ_k, Σ_k),   P(s_t = k | s_{t−1} = j) = A_{jk}
+```
+
+- Fit by EM (Baum-Welch) on a rolling 2000-bar window, refit weekly.
+- **Use filtered probabilities only** `γ_t(k) = P(s_t = k | x_{1..t})` — the
+  forward pass. Smoothed (forward-backward) probabilities use future data and
+  are lookahead; the no-lookahead test must cover this.
+- States are labeled post-hoc each refit by their moments: the state with
+  highest |μ_return|/σ = "trend", highest Σ variance = "crisis", remainder =
+  "chop". Exported features: `p_trend, p_chop, p_crisis`, `state_persistence`
+  (self-transition `A_kk` of the currently most likely state).
+- Hard gate: **no new entries while `p_crisis > 0.5`** — crisis bars are where
+  backtested edges evaporate and spreads explode.
+
+**(b) Lo–MacKinlay variance ratio** as a lightweight cross-check feature:
+
+```
+VR(q) = Var(r_t^{(q)}) / (q · Var(r_t))     (q-bar vs 1-bar returns, q=10)
+```
+
+`VR > 1` ⇒ momentum/trending, `VR < 1` ⇒ mean-reverting. Export `vr_10` and its
+heteroskedasticity-robust z-statistic `vr_z`. (This formalizes and replaces the
+role Hurst played alone in v1; keep Hurst too — they disagree informatively.)
+
+### 8.4 Stationarity with memory — fractional differentiation (`model/frac_diff.py`)
+
+Raw prices are non-stationary (models overfit trends); returns are stationary
+but memoryless (the model can't see levels). Fractional differencing keeps both:
+
+```
+X̃_t = Σ_{k=0}^{K} w_k · X_{t−k},   w_0 = 1,  w_k = −w_{k−1} · (d − k + 1) / k
+```
+
+applied to log price, weights truncated at `|w_k| < 1e−4`. Choose the **smallest
+d ∈ {0.1, 0.2, …, 1.0}** whose output passes the ADF test at 95% confidence on
+the training window (typically d ≈ 0.3–0.5). Export `ffd_price` and
+`ffd_price_z`. Re-select d only at walk-forward retrain boundaries.
+
+### 8.5 Dataset assembly (`model/dataset.py`)
+
+- Per-symbol matrices with tier-gated columns (§7.0) + symbol one-hot for
+  pooled training; every §8.2–8.4 output is a column.
+- **Purged K-fold with embargo** (`EMBARGO_PCT=0.01`): drop training samples
+  whose label window `[t, t_touch]` overlaps any test sample's window, then
+  embargo 1% of samples after each test block. Mandatory — overlapping-label
+  leakage is the #1 cause of fake backtests.
+- **Sample weights (new):** overlapping labels are not i.i.d. Weight each
+  sample by its *average uniqueness* — over the bars of its label window,
+  `u_i = mean_t ( 1 / (# labels concurrently open at t) )` — multiplied by a
+  linear time-decay from 0.5 (oldest) to 1.0 (newest). Passed to LightGBM as
+  `sample_weight`. Without this, dense signal clusters dominate training.
+- Persist with `dataset_version` = hash(features, tiers, label params, d, range).
+
+### 8.6 Primary model — direction (`model/train.py`)
+
+LightGBM classifier estimating `P(y = +1)` (up-barrier first):
+`num_leaves=31, max_depth=6, lr=0.05, n_estimators=400,
+min_child_samples=100, subsample=0.8, colsample_bytree=0.8`, sample weights
+from §8.5, class weights for the vertical-barrier zeros. Tuned **only** via
+purged CV; hyperparameters frozen after the first walk-forward window.
+Persist model + `metrics.json` + feature-gain report (alert if any single
+feature > 40% gain — leakage smell). The primary's job is *direction candidate
+generation*; its raw probability is deliberately not traded directly.
+
+### 8.7 Meta-labeling — bet/no-bet and size (`model/meta.py`)
+
+The López de Prado meta-labeling construction, which consistently improves
+precision on weak primaries by separating "which way" from "whether to bet":
+
+1. **Primary events:** every bar where the primary says `|p_up − 0.5| ≥ δ`
+   (δ = `PRIMARY_DELTA`, default 0.03) or the DEMA baseline (L0) crosses —
+   direction `d_t = sign(p_up − 0.5)` (or the cross direction for L0 events).
+2. **Meta-label:** run the triple barrier *in direction `d_t`*; label
+   `m_t = 1` if the profit-target barrier is hit first, else 0.
+3. **Meta-model:** second LightGBM on the same features **plus**
+   `p_up, |p_up−0.5|, d_t, source (L0/L1)` predicting `P(m_t = 1)` — i.e., the
+   probability *this specific trade idea* works. Same purged CV, same weights.
+4. The traded probability everywhere downstream is the **meta probability**
+   `p̂ = P(m=1)`, not the primary's `p_up`.
+
+Why this is mathematically the right decomposition: the primary optimizes
+recall over both directions on all bars; the meta optimizes precision on the
+exact conditional distribution of *proposed trades* — which is the distribution
+the trade inequality of §8.0 actually applies to.
+
+### 8.8 Calibration + conformal abstention (`model/conformal.py`)
+
+- **Isotonic calibration** of the meta probability on a held-out calibration
+  fold (as before) — post-calibration reliability diagram saved with the model;
+  max calibration error (10-bin ECE) must be < 0.05.
+- **Split-conformal gate (new):** on the calibration fold compute
+  nonconformity scores `α_i = 1 − p̂_i(true class)`. Let `q̂` be the
+  `⌈(n+1)(1−ε)⌉/n` empirical quantile of `α` with `ε = CONFORMAL_EPS`
+  (default 0.2). At trade time, the bet is allowed only if
+  `1 − p̂ ≤ q̂` — i.e. the (1−ε) conformal prediction set contains *only*
+  "success". This is a distribution-free guarantee that, on exchangeable data,
+  at most ε of allowed bets are mispredicted at this confidence level — a
+  principled abstention rule rather than an arbitrary second threshold.
+  (Markets aren't perfectly exchangeable — the guarantee degrades under drift,
+  which is exactly what §8.10 monitors.)
+
+### 8.9 Kalman trend filter (`model/kalman.py`)
+
+Local-linear-trend state space on bar closes — state `[level, velocity]`:
+
+```
+F = [[1,1],[0,1]],  H = [1,0],  Q = diag(q, q),  R = [r]
+predict:  x̂ = F x,  P = F P Fᵀ + Q
+update:   K = P Hᵀ (H P Hᵀ + R)⁻¹,  x̂ += K (z − H x̂),  P = (I − K H) P
+```
+
+`KALMAN_Q=1e-5, KALMAN_R=1e-2`, per-symbol overridable. Outputs `kf_level,
+kf_velocity, kf_velocity_z` — features and the trailing-stop anchor (§9.1).
+
+### 8.10 Live drift monitoring (`model/drift.py`)
+
+Edges decay; the system must know when its training distribution no longer
+matches reality:
+
+- **PSI** per feature, live window (last 5 sessions) vs training distribution,
+  10 quantile bins: `PSI = Σ (p_i − q_i)·ln(p_i / q_i)`. `PSI > 0.25` on ≥ 3
+  features ⇒ WARN + flag in health endpoint; on ≥ 6 ⇒ block new entries, alert
+  "retrain required".
+- **KS test** on the live distribution of meta probabilities vs the
+  calibration fold: p-value < 0.01 ⇒ calibration is stale ⇒ same escalation.
+- Rolling live hit-rate vs conformal expectation: if realized error over the
+  last 50 allowed bets exceeds `ε + 0.10`, block entries (the conformal
+  guarantee is broken — distribution has shifted).
 
 ---
 
@@ -491,17 +682,31 @@ kf_velocity, kf_velocity_z`; used as features and for trailing stops.
 
 ### 9.1 Decision logic (`model/ensemble.py`)
 
+The full pipeline of §8, composed. Per bar:
+
 ```
-L0_long  = DEMA10 crossed above DEMA20 this bar AND close > DEMA95
-L0_short = DEMA10 crossed below DEMA20 this bar AND close < DEMA95
-L1_long  = p_up ≥ P_ENTRY (0.60)      L1_short = p_up ≤ 1 − P_ENTRY
-# Orderflow gate uses the best available tier:
-gate_long  = (T1: ofi/cvd_slope > 0) else (T0: pdelta_slope > 0 AND updown_ratio > 1)
-gate_short = symmetric
-signal = BUY  if (L1_long and gate_long)  or (L0_long and gate_long)
-signal = SELL if (L1_short and gate_short) or (L0_short and gate_short)
-else HOLD
-confidence = p_up (BUY) / 1−p_up (SELL) / 0.5
+# 1. Candidate generation (primary + baseline)
+L1_event = |p_up − 0.5| ≥ PRIMARY_DELTA          → direction d = sign(p_up − 0.5)
+L0_event = DEMA10×DEMA20 cross with DEMA95 trend  → direction d = cross direction
+if no event: HOLD
+
+# 2. Regime & environment gates (any failure → HOLD)
+p_crisis ≤ 0.5                                    (§8.3 HMM)
+regime guard of §9.2 passes
+orderflow gate agrees with d:
+    T1: sign(ofi_zscore) == d and sign(cvd_slope_n) == d
+    T0: sign(pdelta_slope) == d and (updown_ratio − 1) has sign d
+
+# 3. Meta-decision (the bet/no-bet mathematics)
+p̂       = calibrated meta probability for this event (§8.7–8.8)
+p*      = (σ + c_live) / (π + σ)                  cost-aware breakeven (§8.0),
+                                                   c_live from current spread+ATR
+trade  iff  p̂ ≥ p* + EDGE_MARGIN  AND  conformal gate allows (1 − p̂ ≤ q̂)
+
+signal = BUY if d > 0 else SELL;  confidence = p̂
+# L0-only events (no trained model yet) use p̂ = historical L0 hit rate from the
+# backtest report, and trade at reduced fixed size (§9.3) — the system still
+# emits buy/sell signals before/without ML, as required.
 ```
 
 Exits: opposite signal, native SL/TP touch (server-side), trailing stop —
@@ -519,13 +724,26 @@ within `SKIP_MIN_AFTER_OPEN`/Friday-close windows (§2.3).
   via `account_info().currency` (assume USD account by default; if INR-funded
   via broker, conversion handled by broker — use `account_info().balance`
   directly and treat `CAPITAL_TOTAL` as account-currency).
-- `risk_amt = capital × RISK_PER_TRADE_PCT (0.5%)`.
+- **Kelly sizing from the calibrated edge (replaces ad-hoc scaling).** For a
+  bet with odds `b = π/σ` (reward:risk ratio) and calibrated success
+  probability `p̂`, the growth-optimal fraction is
+
+  ```
+  f* = (p̂·(b + 1) − 1) / b          (≤ 0 ⇒ no trade — consistent with §8.0)
+  f  = KELLY_FRACTION × f*           (fractional Kelly, default 0.5)
+  risk_frac = min(f, RISK_PER_TRADE_PCT)   # hard cap, default 0.5%
+  risk_amt  = capital × risk_frac
+  ```
+
+  Fractional Kelly because p̂ is estimated with error: half-Kelly gives ~75% of
+  optimal growth at half the drawdown variance, and is robust to calibration
+  error of a few points.
 - Stop distance in account currency per lot:
-  `stop_value = (SL_MULT × ATR / tick_size) × tick_value`.
+  `stop_value = (SL_MULT × har_atr / tick_size) × tick_value` — note **HAR-ATR**
+  (§8.2), so size shrinks automatically when forecast volatility rises.
 - `lots = round_step(risk_amt / stop_value, volume_step)`, clipped to
   `[volume_min, min(volume_max, MAX_LOTS=1.0)]`; if below `volume_min` → no trade.
-- Kelly modulation `size_mult = clip(2×confidence − 1, 0, 1) × KELLY_FRACTION
-  (0.5)`; baseline-path (L0) trades fixed `size_mult = 0.25`.
+- Baseline-path (L0-only) trades use fixed `risk_frac = 0.25 × RISK_PER_TRADE_PCT`.
 - Margin pre-check via `order_check` — mandatory before every entry.
 - **Correlation guard (USD leg):** long EURUSD, long GBPUSD, short USDJPY, long
   XAUUSD, long XAGUSD are all short-USD. Net same-direction USD-group entries
@@ -539,8 +757,12 @@ within `SKIP_MIN_AFTER_OPEN`/Friday-close windows (§2.3).
 ### 9.4 Signal schema (`signals.py`)
 
 As v1 with field renames: `contract_key → symbol_key`, `security_id →
-broker_symbol`; add `lots: float`, `tier: str` ("T0"/"T1"/"T2"). Every non-HOLD
-signal optionally POSTs to `SIGNAL_WEBHOOK_URL`.
+broker_symbol`; add `lots: float`, `tier: str` ("T0"/"T1"/"T2"). The
+`features_digest` must include the decision mathematics for auditability:
+`{p_hat, p_star, edge (= p_hat − p_star), kelly_f, conformal_q, p_crisis,
+vol_surprise, ofi_z_or_pdelta, adx, vr_10, spread_pct}` — every live trade is
+explainable after the fact from its journal row alone. Every non-HOLD signal
+optionally POSTs to `SIGNAL_WEBHOOK_URL`.
 
 ---
 
@@ -564,13 +786,40 @@ Per round trip, config-driven:
 - **Slippage**: `DEFAULT_SLIPPAGE_POINTS=2` per side on top of spread (stress
   test at 2× in the report).
 
-### 10.3 Walk-forward
+### 10.3 Walk-forward + anti-overfitting statistics
 Train 60 trading days → test 10 → step 10; ≥ 6 windows; hyperparameters frozen
-after first-window purged-CV tune; recalibrate each step. Report JSON + MD +
-equity PNG in `reports/`. **Deployment gate in code**: aggregate
-`profit_factor_after_costs ≥ 1.1` AND `max_dd ≤ 10%` of module capital. The
-report must also show per-symbol breakdown — a symbol with PF < 1.0 gets dropped
-from the live universe (`reports/live_universe.json`).
+after first-window purged-CV tune; recalibrate (isotonic + conformal q̂) each
+step. Report JSON + MD + equity PNG in `reports/`.
+
+**Deployment gate in code (all three must hold):**
+1. Aggregate `profit_factor_after_costs ≥ 1.1`
+2. `max_dd ≤ 10%` of module capital
+3. **Probabilistic Sharpe Ratio ≥ 0.95** on the concatenated OOS trade returns:
+
+   ```
+   PSR(SR*) = Φ( (SR − SR*)·√(n − 1) / √(1 − γ₃·SR + ((γ₄ − 1)/4)·SR²) )
+   ```
+
+   with benchmark `SR* = 0`, `n` = number of OOS trades, `γ₃/γ₄` = skew/kurtosis
+   of trade returns. This asks: *given how many trades we have and how non-normal
+   they are, what is the probability the true Sharpe is above zero?* A PF of 1.3
+   on 40 fat-tailed trades can easily fail this gate — that is the point.
+
+**Trial accounting (mandatory):** every configuration evaluated against OOS data
+(feature sets, label params, hyperparameter tunes) increments a counter persisted
+in `reports/trials.json`. The report computes the **Deflated Sharpe Ratio** —
+PSR with `SR*` set to the expected maximum Sharpe among `N` independent trials:
+
+```
+SR* = √Var(SR_trials) · ( (1 − γ)·Φ⁻¹(1 − 1/N) + γ·Φ⁻¹(1 − 1/(N·e)) ),  γ ≈ 0.5772
+```
+
+DSR is reported (not gated in v1) so the operator sees how much of the observed
+performance is explainable by selection over N tries. If N grows past ~50, treat
+a DSR < 0.5 as a de-facto failure regardless of the formal gates.
+
+Per-symbol breakdown required; any symbol with PF < 1.0 is dropped from
+`reports/live_universe.json`.
 
 ---
 
@@ -641,8 +890,11 @@ UNIVERSE=EURUSD,GBPUSD,USDJPY,XAUUSD,XAGUSD,WTI,NATGAS,COPPER
 MAX_MEDIAN_SPREAD_PCT_FX=0.03  MAX_MEDIAN_SPREAD_PCT_CMD=0.06  MAX_LIVE_SPREAD_PCT=0.08
 ALLOW_OVERNIGHT=false  SQUARE_OFF_MIN_BEFORE_SWAP=15  SKIP_MIN_AFTER_OPEN=30
 # strategy / model
-BAR_INTERVAL_S=60  PT_MULT=2.0  SL_MULT=1.0  MAX_HOLD_BARS=60  P_ENTRY=0.60
+BAR_INTERVAL_S=60  PT_MULT=2.0  SL_MULT=1.0  MAX_HOLD_BARS=60
+EDGE_MARGIN=0.05  PRIMARY_DELTA=0.03  CONFORMAL_EPS=0.2
 IMBALANCE_RATIO=3.0  TRAIL_MULT=1.5  KALMAN_Q=1e-5  KALMAN_R=1e-2  EMBARGO_PCT=0.01
+HMM_STATES=3  HMM_WINDOW_BARS=2000  HAR_REFIT_DAYS=7  FFD_ADF_ALPHA=0.05
+DRIFT_PSI_WARN=0.25  DRIFT_PSI_FEATURES_BLOCK=6
 # data
 DATA_ROOT=./data_root  FLUSH_INTERVAL_S=60  POLL_INTERVAL_MS=200  DOM_SNAPSHOT_INTERVAL_MS=500
 # costs
@@ -671,9 +923,14 @@ historical span; tick-derived features over the recorded window).
 green on Linux CI.
 
 ### Phase 3 — Model + walk-forward
-**Gate:** OOS PF after costs ≥ 1.1, max DD ≤ 10%; per-symbol live universe
-written. Failed symbols dropped; if all fail, baseline-only mode at 0.25 size —
-never lower the gate.
+Deliverables: all of `model/` (§8.0–8.10: HAR, HMM, FFD, primary, meta,
+conformal, drift monitor), walk-forward runner with PSR/DSR statistics.
+**Gate:** OOS PF after costs ≥ 1.1, max DD ≤ 10%, **PSR ≥ 0.95** (§10.3);
+HAR beats random-walk RV forecast OOS; meta-model precision on allowed bets
+exceeds the primary's precision (that is meta-labeling's whole job — if it
+doesn't, investigate before proceeding); calibration ECE < 0.05. Per-symbol
+live universe written. Failed symbols dropped; if all fail, baseline-only mode
+at 0.25 size — never lower the gates.
 
 ### Phase 4 — Paper, then live
 `paper.py` uses the real adapter on a **demo account** (MT5 demo = identical
@@ -682,10 +939,15 @@ within 30% of backtest, zero reconciliation mismatches. Then live with
 `MAX_LOTS=0.01` hard-clamped for the first two weeks regardless of sizing.
 
 ### Testing requirements
-pytest; ≥ 90% line coverage on `features/`, `model/labeling.py`,
-`execution/risk.py`; no-lookahead test; risk tests (halt persistence across
+pytest; ≥ 90% line coverage on `features/`, `model/labeling.py`, `model/har.py`,
+`model/regime.py`, `model/conformal.py`, `execution/risk.py`; no-lookahead test
+(must cover HMM filtered-vs-smoothed probabilities explicitly); math unit tests
+against hand-computed fixtures for: breakeven `p*`, Kelly `f*`, FFD weights,
+variance ratio, PSI, PSR; conformal coverage test on synthetic exchangeable
+data (realized error ≤ ε within tolerance); risk tests (halt persistence across
 restart, correlation guard blocks 3rd USD position, volume_step rounding never
-exceeds caps); adapter retcode-handling tests with mocked `order_send`.
+exceeds caps, Kelly f* ≤ 0 produces no trade); adapter retcode-handling tests
+with mocked `order_send`.
 
 ---
 
