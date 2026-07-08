@@ -98,8 +98,17 @@ Executed in four phases, each independently shippable:
 
 ## Part 3 — New module: `fx_commodities/`
 
+> **AMENDED 2026-07-08:** This part originally targeted Dhan (Indian exchanges).
+> Per user decision, `fx_commodities/` now targets **MetaTrader 5 / third-party
+> brokers** for true global FX spot (EURUSD/GBPUSD/USDJPY), bullion
+> (XAUUSD/XAGUSD), and commodity CFDs. The authoritative, buildable spec is
+> [`fx_commodities/REQUIREMENTS.md`](fx_commodities/REQUIREMENTS.md) **v2.0** —
+> where it conflicts with the text below, REQUIREMENTS.md wins. The section
+> below is retained for the architectural rationale (features, model, risk),
+> which carries over.
+
 Prediction and trading engine for **currency crosses, bullion, and commodities**,
-executed through Dhan on Indian exchanges.
+originally scoped for Dhan on Indian exchanges (superseded — see amendment above).
 
 ### 3.1 Instruments
 

@@ -1,14 +1,15 @@
 # hypipe
 
-Algorithmic trading systems built on the [Dhan](https://dhan.co) broker API.
+Algorithmic trading systems: Indian index options via [Dhan](https://dhan.co),
+global FX/bullion/commodities via MetaTrader 5.
 
 ## Modules
 
-| Module | Status | Description |
-|--------|--------|-------------|
-| [`indices/`](indices/) | Built | DEMA 10/20/95 crossover options trader for NIFTY, BANKNIFTY, MIDCPNIFTY, FINNIFTY weekly options — standalone polling bot + TradingView webhook automation |
-| [`fx_commodities/`](fx_commodities/REQUIREMENTS.md) | Spec complete | Orderflow + liquidity-heatmap prediction engine for currency futures (cross + INR pairs), bullion minis (GOLDM/SILVERM), and commodities (CRUDEOILM/NATURALGAS/COPPER) — full build spec in REQUIREMENTS.md |
-| `common/` | Planned | Shared plumbing: Dhan auth/token renewal, retry & circuit breaker, trade journal |
+| Module | Status | Broker | Description |
+|--------|--------|--------|-------------|
+| [`indices/`](indices/) | Built | Dhan | DEMA 10/20/95 crossover options trader for NIFTY, BANKNIFTY, MIDCPNIFTY, FINNIFTY weekly options — standalone polling bot + TradingView webhook automation |
+| [`fx_commodities/`](fx_commodities/REQUIREMENTS.md) | Spec complete (v2.0) | MT5 (broker-agnostic adapter) | Orderflow + quote-dynamics prediction engine for FX spot (EURUSD/GBPUSD/USDJPY), bullion (XAUUSD/XAGUSD), and commodity CFDs (WTI/NATGAS/COPPER) — full build spec in REQUIREMENTS.md |
+| `common/` | Planned | — | Shared plumbing: retry & circuit breaker, trade journal, alerting |
 
 See [PLAN.md](PLAN.md) for the full system audit, hardening roadmap, and the
 `fx_commodities/` design.

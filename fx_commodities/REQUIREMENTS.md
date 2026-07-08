@@ -1,7 +1,8 @@
 # fx_commodities — Build Requirements Specification
 
-**Version 1.0 — 2026-07-08**
+**Version 2.0 — 2026-07-08 — MT5 / third-party-broker edition**
 **Status: APPROVED FOR BUILD**
+**Supersedes v1.0 (Dhan edition). Dhan remains the broker for `indices/` only.**
 
 This document is a complete, self-contained implementation brief. An engineer (or
 AI model) with no prior context on this repository must be able to build the entire
@@ -13,809 +14,701 @@ module from this document alone. Read it fully before writing any code.
 
 ### 0.1 What this module is
 
-A prediction and trading engine for **currency futures, bullion, and commodities**
-on Indian exchanges via the [Dhan](https://dhan.co) broker API v2. It produces
+A prediction and trading engine for **spot FX (EURUSD, GBPUSD, USDJPY), bullion
+(XAUUSD, XAGUSD), and commodity CFDs (WTI crude, natural gas, copper)** executed
+through **MetaTrader 5**, behind a broker-abstraction layer so other brokers
+(OANDA, cTrader, IBKR) can be added without touching strategy code. It produces
 `BUY / SELL / HOLD` signals with confidence, entry, stop-loss, and target, using
-orderflow analytics, liquidity heatmaps, volume profile, and a machine-learning
-ensemble — then executes them with strict risk controls.
+orderflow analytics (where the broker's data supports them), liquidity/quote
+dynamics, volume profile, and a machine-learning ensemble — then executes with
+strict risk controls.
 
-### 0.2 Locked-in decisions (do not revisit)
+### 0.2 Why MT5 (and what it changes vs the Dhan design)
+
+| Aspect | Dhan (v1 design) | MT5 (this design) |
+|---|---|---|
+| Instruments | NSE/MCX Indian futures | True global FX spot, spot metals, commodity CFDs |
+| Sessions | Exchange hours (IST) | 24/5 continuous; daily swap at server midnight |
+| Data push | Websocket push | **Pull only** — the Python API polls; no push feed |
+| Volume | Real exchange volume | `tick_volume` (quote updates); `volume_real` usually 0 on FX/CFD — **orderflow features must adapt** (§7.0) |
+| Depth | 5/20-level exchange book | `market_book_*` DOM only if the broker streams it (many retail brokers don't) |
+| Stops | Separate stop order legs | **Native `sl`/`tp` on the position** — server-side, survives our process dying |
+| Platform | Any OS (REST) | **Windows-only Python package**; terminal must run on same machine (§0.4) |
+
+### 0.3 Locked-in decisions (do not revisit)
 
 | # | Decision | Value |
 |---|----------|-------|
-| D1 | Currency pair selection | **Data-driven.** Record both NSE cross pairs (EURUSD, GBPUSD, USDJPY) and INR pairs (USDINR, EURINR, GBPINR, JPYINR) during Phase 1. After ≥ 5 trading days, compute median relative spread per contract; drop any contract whose median spread > `MAX_MEDIAN_SPREAD_PCT` (default 0.05%). Remaining contracts form the tradeable universe. |
-| D2 | MCX contract size | **Mini contracts only**: GOLDM (100 g), SILVERM (5 kg), CRUDEOILM (10 bbl), NATURALGAS mini variant if listed (else standard NATURALGAS), COPPER standard (no mini exists). |
-| D3 | Capital allocation | Configurable split between this module and `indices/`. Default `ALLOC_FX_COMMODITIES=0.50` of `CAPITAL_TOTAL`. All risk limits in this module derive from its allocated slice only. |
+| D1 | Universe selection is **data-driven**: record all candidate symbols during Phase 1; drop any whose median relative spread > `MAX_MEDIAN_SPREAD_PCT` (default 0.03% for FX majors, 0.06% for metals/commodities). |
+| D2 | Small-account sizing: volumes in **fractional lots**, min 0.01, always respecting `volume_min/step/max` from `symbol_info`. |
+| D3 | Capital split with `indices/` stays: `ALLOC_FX_COMMODITIES` (default 0.50) of `CAPITAL_TOTAL`. All module risk limits derive from that slice. |
+| D4 | Broker abstraction is mandatory: strategy/risk code may import **only** `broker/base.py` types, never `MetaTrader5` directly. |
 
-### 0.3 Hard constraints for the implementer
+### 0.4 Hard constraints for the implementer
 
-1. **Do NOT modify anything under `indices/`.** It is a frozen, working system.
-2. All new code lives under `fx_commodities/` and `common/` (new shared package).
-3. Python ≥ 3.11. Type hints everywhere. No TypeScript-style comments; docstrings
-   state *what a constraint is*, not what the next line does.
-4. Every external call (HTTP, websocket) goes through the retry/circuit-breaker
-   wrapper in `common/` (spec §12).
-5. Nothing trades live until the Phase gates in §14 pass. The live executor must
-   refuse to start if the walk-forward report file is absent or shows
+1. **Do NOT modify anything under `indices/`.** It stays Dhan-based and frozen.
+2. New code lives in `fx_commodities/` and `common/`. Python ≥ 3.11, full type
+   hints. The `MetaTrader5` package pins the runtime to **Windows** (or a Windows
+   VPS / Wine). All non-broker code (features, model, backtest) must remain
+   OS-independent and testable on Linux with recorded data — CI runs everything
+   except `broker/mt5_adapter.py` integration tests.
+3. Every broker call goes through the adapter + retry policy (§12).
+4. Nothing trades live until the Phase gates (§14) pass. `trader.py --live`
+   refuses to start if the latest walk-forward report is missing or shows
    `profit_factor_after_costs < 1.1`.
-6. No secrets in code or committed files. All credentials via `.env`.
-7. **Critical platform limitation** discovered during research: Dhan's 20-level
-   depth websocket supports **NSE segments only** (equity + derivatives). MCX is
-   NOT supported. Therefore: NSE currency contracts get 20-level heatmaps; MCX
-   bullion/commodities get 5-level heatmaps built from the regular feed's Full
-   packet. The heatmap module must handle both depths transparently (§7.2).
+5. No secrets in code. Credentials via `.env` only.
+6. Every order carries this module's **magic number** (`MAGIC=520025`, config-
+   overridable). The executor must never touch positions whose magic differs —
+   that is how we coexist with manual trades and other EAs on the same account.
 
 ---
 
-## 1. Dhan API reference (verified against docs v2)
+## 1. MT5 Python API reference (verified)
 
-Everything the module needs from Dhan, with exact formats. Base REST URL:
-`https://api.dhan.co/v2`. Auth headers on every REST call:
+Package: `pip install MetaTrader5` (imported as `mt5`). The MT5 **terminal must be
+installed, logged in, and running** on the same Windows machine; the package is an
+IPC bridge to it, not a network client.
 
+### 1.1 Session lifecycle
+
+```python
+mt5.initialize(path=r"C:\Program Files\MetaTrader 5\terminal64.exe",
+               login=12345678, password="...", server="Broker-Server",
+               timeout=10_000)          # → bool; mt5.last_error() on failure
+mt5.account_info()   # balance, equity, margin_free, currency, leverage,
+                     # margin_so_call, trade_mode (demo/real), margin_mode
+                     #   (NETTING vs HEDGING — record it; executor logic §11.2)
+mt5.terminal_info()  # connected, trade_allowed, ping_last
+mt5.shutdown()
 ```
-access-token: <ACCESS_TOKEN>       (JWT, expires every 24 h)
-client-id: <CLIENT_ID>
-Content-Type: application/json
+
+`initialize` must be wrapped with a watchdog: if `terminal_info().connected` goes
+false, alert + block new entries until reconnected (positions keep their
+server-side SL/TP — that is the safety net).
+
+### 1.2 Symbols
+
+```python
+mt5.symbol_select(sym, True)          # add to Market Watch — required before data/orders
+si = mt5.symbol_info(sym)
+# fields used: digits, point, spread, trade_tick_size, trade_tick_value,
+# trade_contract_size, volume_min, volume_max, volume_step,
+# swap_long, swap_short, swap_rollover3days (day of triple swap),
+# filling_mode (bitmask of allowed ORDER_FILLING_*), trade_mode,
+# session_deals / session_buy_orders (optional), currency_profit
 ```
 
-### 1.1 Live Market Feed websocket (ticks + 5-level depth)
+**Pip/point value:** rupee/dollar value of one point per lot =
+`trade_tick_value × (point / trade_tick_size)`. Use this — never hardcode pip
+values; contract sizes differ per broker.
 
+### 1.3 Candles & ticks (pull model)
+
+```python
+mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, 5000)
+# numpy structured array: time (epoch s), open, high, low, close,
+#                         tick_volume, spread, real_volume
+mt5.copy_ticks_from(sym, from_dt, 100_000, mt5.COPY_TICKS_ALL)
+mt5.copy_ticks_range(sym, from_dt, to_dt, mt5.COPY_TICKS_ALL)
+# tick fields: time, bid, ask, last, volume, time_msc (epoch ms),
+#              flags, volume_real
+# flags bitmask: TICK_FLAG_BID(2) ask(4) LAST(8) VOLUME(16) BUY(32) SELL(64)
 ```
-wss://api-feed.dhan.co?version=2&token=<ACCESS_TOKEN>&clientId=<CLIENT_ID>&authType=2
+
+- Live "streaming" = poll `copy_ticks_from(sym, last_seen_ms, ...)` on a tight
+  loop (`POLL_INTERVAL_MS`, default 200 ms across the universe, §4.1) and
+  de-duplicate on `time_msc`.
+- History depth: brokers keep weeks–months of ticks and years of M1 — Phase 1
+  must probe actual availability per symbol and record the answer.
+
+### 1.4 Depth of market (optional per broker)
+
+```python
+mt5.market_book_add(sym)              # subscribe
+book = mt5.market_book_get(sym)      # tuple of BookInfo(type, price, volume, volume_dbl)
+# type: BOOK_TYPE_SELL=1 (ask), BOOK_TYPE_BUY=2 (bid),
+#       BOOK_TYPE_SELL_MARKET=3, BOOK_TYPE_BUY_MARKET=4
+mt5.market_book_release(sym)
 ```
 
-- Max **5 websocket connections** per user; max 5000 instruments/connection;
-  max **100 instruments per subscription message**.
-- Requests are JSON; responses are **binary, little-endian**.
-- Server pings every 10 s; connection dies after 40 s without pong (standard
-  websocket libraries auto-pong — verify yours does).
-- Disconnection code 805 = more than 5 sockets; oldest killed.
+Returns an empty tuple when the broker provides no DOM for that symbol — the
+capability probe (§4.0) records this per symbol.
 
-**Subscribe** (RequestCode 15 = ticker, 17 = quote, 21 = full — use **21 Full**
-for tradeable universe, 15 Ticker for anything watch-only):
+### 1.5 Orders and positions
 
-```json
-{
-  "RequestCode": 21,
-  "InstrumentCount": 2,
-  "InstrumentList": [
-    {"ExchangeSegment": "MCX_COMM", "SecurityId": "428301"},
-    {"ExchangeSegment": "NSE_CURRENCY", "SecurityId": "12345"}
-  ]
+```python
+req = {
+  "action":   mt5.TRADE_ACTION_DEAL,          # market execution
+  "symbol":   sym,
+  "volume":   0.10,                            # lots, float
+  "type":     mt5.ORDER_TYPE_BUY,              # or ORDER_TYPE_SELL
+  "price":    mt5.symbol_info_tick(sym).ask,
+  "sl":       1.06920,                         # native server-side stop
+  "tp":       1.07480,                         # native server-side target
+  "deviation": 20,                             # max slippage, points
+  "magic":    520025,
+  "comment":  "fxc-20260708-0001",             # correlation id, ≤ 31 chars
+  "type_time": mt5.ORDER_TIME_GTC,
+  "type_filling": <from symbol_info.filling_mode>,  # IOC preferred, else FOK
 }
+chk = mt5.order_check(req)     # margin/validity pre-check — ALWAYS call first
+res = mt5.order_send(req)      # OrderSendResult
+# res.retcode == mt5.TRADE_RETCODE_DONE (10009) → success
+# res.deal, res.order, res.price (actual fill), res.volume
 ```
 
-**Binary response header (8 bytes, all packet types):**
-
-| Offset | Type | Field |
-|--------|------|-------|
-| 0 | uint8 | Feed response code |
-| 1–2 | int16 | Payload length |
-| 3 | uint8 | Exchange segment (numeric) |
-| 4–7 | int32 | Security ID |
-
-**Packet types to parse:**
-
-*Ticker (code 2):* header + float32 LTP (bytes 8–11) + int32 last-trade-time
-epoch (bytes 12–15).
-
-*Quote (code 4):* header + LTP f32, last-traded-qty i16, LTT i32, ATP f32,
-volume i32, total sell qty i32, total buy qty i32, day open/close/high/low f32
-(offsets per Dhan docs; total 50 bytes).
-
-*OI (code 5):* header + int32 open interest.
-
-*Prev close (code 6):* header + f32 prev close + i32 prev OI.
-
-*Full (code 8, 162 bytes):* everything in Quote + OI + highest/lowest OI day +
-**5 × 20-byte depth levels** at bytes 63–162. Each 20-byte level:
-
-| Offset in level | Type | Field |
-|------|------|-------|
-| 0–3 | int32 | Bid quantity |
-| 4–7 | int32 | Ask quantity |
-| 8–9 | int16 | Bid order count |
-| 10–11 | int16 | Ask order count |
-| 12–15 | float32 | Bid price |
-| 16–19 | float32 | Ask price |
-
-*Disconnect (code 50):* header + int16 disconnect reason.
-
-**Unsubscribe / disconnect:** send `{"RequestCode": 12}`.
-
-### 1.2 20-level depth websocket (NSE only — currency contracts)
-
-```
-wss://depth-api-feed.dhan.co/twentydepth?token=<ACCESS_TOKEN>&clientId=<CLIENT_ID>&authType=2
-```
-
-- Max **50 instruments per connection**. Subscribe with RequestCode **23**,
-  same InstrumentList shape as §1.1.
-- **Response header is 12 bytes** (differs from §1.1!):
-
-| Offset | Type | Field |
-|--------|------|-------|
-| 0–1 | int16 | Message length |
-| 2 | uint8 | Feed code: **41 = bid side, 51 = ask side** |
-| 3 | uint8 | Exchange segment |
-| 4–7 | int32 | Security ID |
-| 8–11 | uint32 | Message sequence number |
-
-- Payload: **20 levels × 16 bytes** = 320 bytes. Per level: float64 price
-  (0–7), uint32 quantity (8–11), uint32 order count (12–15).
-- Bid and ask arrive as **separate messages** (codes 41/51) — the book builder
-  must pair them by (securityId, sequence proximity).
-- Track sequence gaps: if `seq` jumps by > 1, mark the book snapshot as
-  `degraded=True` until the next clean pair.
-
-### 1.3 Historical candles (REST)
-
-- `POST /charts/intraday` — 1/5/15/25/60-minute OHLCV+OI, up to 5 years back,
-  **max 90 days per request** (must paginate).
-- `POST /charts/historical` — daily OHLCV+OI back to inception.
-
-Request body (both):
-
-```json
-{
-  "securityId": "428301",
-  "exchangeSegment": "MCX_COMM",
-  "instrument": "FUTCOM",
-  "interval": "1",
-  "oi": true,
-  "fromDate": "2026-06-01",
-  "toDate": "2026-07-08"
-}
-```
-
-Response arrays: `open[], high[], low[], close[], volume[], timestamp[] (epoch),
-open_interest[]`.
-
-### 1.4 Orders (REST)
-
-`POST /orders` with body fields: `dhanClientId, correlationId (≤30 chars),
-transactionType (BUY|SELL), exchangeSegment, productType, orderType
-(LIMIT|MARKET|STOP_LOSS|STOP_LOSS_MARKET), validity (DAY|IOC), securityId,
-quantity, price, triggerPrice`. Response: `{orderId, orderStatus}`.
-Order status polling: `GET /orders/{order-id}`. Statuses: TRANSIT, PENDING,
-REJECTED, CANCELLED, PART_TRADED, TRADED, EXPIRED.
-
-- **`correlationId` is mandatory on every order** this module places. Format:
-  `fxc-{yyyymmdd}-{seq:04d}` — it is the idempotency key.
-- Static IP whitelisting is mandatory (web.dhan.co → Profile). 7-day lock after
-  change. The runbook (§15) must tell the operator this.
-
-### 1.5 Token renewal
-
-Access tokens expire every 24 h. `POST /RenewToken` works only for *active*
-tokens. `common/auth.py` must renew on a schedule (§12.1).
-
-### 1.6 Instrument master
-
-CSV: `https://images.dhan.co/api-data/api-scrip-master-detailed.csv`.
-Columns of interest: `SEM_EXCH_EXCH_ID, SEM_SEGMENT, SEM_SMST_SECURITY_ID,
-SEM_TRADING_SYMBOL, SM_SYMBOL_NAME, SEM_EXPIRY_DATE, SEM_LOT_UNITS,
-SEM_TICK_SIZE, SEM_INSTRUMENT_NAME`. Download at startup, cache for the day.
-
-### 1.7 Exchange segment identifiers
-
-| String (REST/JSON) | Numeric (binary feed) |
-|---|---|
-| NSE_EQ | 1 |
-| NSE_FNO | 2 |
-| NSE_CURRENCY | 3 |
-| BSE_EQ | 4 |
-| MCX_COMM | 5 |
-| BSE_CURRENCY | 7 |
-| BSE_FNO | 8 |
+- Modify SL/TP on an open position: `TRADE_ACTION_SLTP` with `position=ticket`.
+- Close: send opposite `TRADE_ACTION_DEAL` with `position=ticket` (hedging mode)
+  — on netting accounts an opposite deal nets automatically.
+- `mt5.positions_get(symbol=...)` → open positions (ticket, volume, price_open,
+  sl, tp, profit, magic, comment).
+- `mt5.history_deals_get(from_dt, to_dt)` → actual fills (price, volume,
+  commission, swap, profit, magic) — **the only source of truth for realized
+  PnL and costs**.
+- Retcodes to handle explicitly: 10009 done, 10004 requote, 10006 rejected,
+  10013 invalid request, 10014 invalid volume, 10016 invalid stops (SL too close
+  — respect `symbol_info.trade_stops_level`), 10018 market closed, 10019 no
+  money, 10027 autotrading disabled in terminal (alert operator!), 10030
+  unsupported filling mode (retry with the other mode once).
 
 ---
 
 ## 2. Instrument universe
 
-### 2.1 Contracts
+### 2.1 Candidate symbols (canonical keys → typical broker names)
 
-| Key | Exchange segment | Instrument | Contract | Session (IST) |
-|-----|------------------|-----------|----------|----------------|
-| EURUSD | NSE_CURRENCY | FUTCUR | Near-month future | 09:00–19:30 |
-| GBPUSD | NSE_CURRENCY | FUTCUR | Near-month future | 09:00–19:30 |
-| USDJPY | NSE_CURRENCY | FUTCUR | Near-month future | 09:00–19:30 |
-| USDINR | NSE_CURRENCY | FUTCUR | Near-month future | 09:00–17:00 |
-| EURINR | NSE_CURRENCY | FUTCUR | Near-month future | 09:00–17:00 |
-| GBPINR | NSE_CURRENCY | FUTCUR | Near-month future | 09:00–17:00 |
-| JPYINR | NSE_CURRENCY | FUTCUR | Near-month future | 09:00–17:00 |
-| GOLDM | MCX_COMM | FUTCOM | Mini, 100 g | 09:00–23:30 |
-| SILVERM | MCX_COMM | FUTCOM | Mini, 5 kg | 09:00–23:30 |
-| CRUDEOILM | MCX_COMM | FUTCOM | Mini, 10 bbl | 09:00–23:30 |
-| NATURALGAS | MCX_COMM | FUTCOM | Mini variant if listed in scrip master, else standard | 09:00–23:30 |
-| COPPER | MCX_COMM | FUTCOM | Standard (no mini exists) | 09:00–23:30 |
+| Key | Class | Typical symbol | Notes |
+|-----|-------|----------------|-------|
+| EURUSD | FX major | `EURUSD` | |
+| GBPUSD | FX major | `GBPUSD` | |
+| USDJPY | FX major | `USDJPY` | JPY quote — 3-digit pricing |
+| XAUUSD | Bullion | `XAUUSD` / `GOLD` | spot gold vs USD |
+| XAGUSD | Bullion | `XAGUSD` / `SILVER` | spot silver |
+| WTI | Energy | `USOIL` / `XTIUSD` / `WTI` | CFD; check expiry-less vs futures-based |
+| NATGAS | Energy | `NATGAS` / `XNGUSD` | CFD |
+| COPPER | Metal | `COPPER` / `XCUUSD` | CFD |
 
-Notes:
-- MCX evening sessions extend to 23:55 during US daylight-saving winter. Read
-  session end from config, not hardcoded.
-- Verify session times for cross pairs from the exchange; if scrip master or a
-  probe tick shows different hours, config wins.
+Broker symbol names vary (suffixes like `EURUSD.r`, `XAUUSDm`). Therefore:
+`SYMBOL_MAP` in `.env` (`EURUSD=EURUSD.r,...`), resolved once at startup;
+`instruments.py` validates every mapped symbol exists via `symbol_info` and
+fails fast listing near-miss candidates (`mt5.symbols_get("*EURUSD*")`).
 
-### 2.2 `instruments.py` requirements
+### 2.2 `instruments.py`
 
-- `@dataclass(frozen=True) class Contract`: `key, exchange_segment (str),
-  segment_code (int), instrument_type, security_id, trading_symbol, expiry (date),
-  lot_size (int), tick_size (float), session_open (time), session_close (time),
-  is_mini (bool), currency_of_quote (str)`.
-- `resolve_universe(scrip_master: pd.DataFrame, today: date) -> list[Contract]`:
-  for each key in §2.1, select the **near-month** future: minimum
-  `SEM_EXPIRY_DATE ≥ today + ROLLOVER_BUFFER_DAYS` (default 2). This implements
-  rollover: 2 days before expiry the resolver naturally advances to next month.
-- Rollover event: when the resolved `security_id` for a key changes vs the journal's
-  open position, the trader must **flatten the old contract** and only then trade
-  the new one. Never hold through expiry.
-- Unit tests: resolver picks correct contract at month boundaries; mini variants
-  chosen when both mini and standard match a key.
+- `@dataclass(frozen=True) class Contract`: `key, broker_symbol, digits, point,
+  tick_size, tick_value, contract_size, volume_min, volume_max, volume_step,
+  stops_level_points, swap_long, swap_short, swap_triple_day, has_dom (bool),
+  has_last_ticks (bool), has_real_volume (bool), quote_ccy`.
+- Capability fields (`has_dom`, `has_last_ticks`, `has_real_volume`) come from
+  the Phase 1 probe (§4.0) persisted to `reports/capabilities.json`; at runtime
+  they gate which features compute for that symbol (§7.0).
+- No expiry/rollover logic needed for spot/CFD — delete that concern from v1.
+  Exception: if the chosen broker's energy CFDs are futures-based with expiry,
+  the probe must detect `symbol_info.expiration_time ≠ 0` and the resolver then
+  applies the v1 rollover rule (flatten 2 days before expiry).
+
+### 2.3 Sessions & timing
+
+- FX/metals trade ~24/5: Monday 00:05 → Friday 23:50 **server time**. All
+  internal timestamps are UTC; server-time offset discovered by comparing
+  `symbol_info_tick().time` to UTC now, persisted per session.
+- **Swap (rollover) cost** applies to positions held across server midnight;
+  triple swap on `swap_rollover3days` (usually Wednesday). Default policy:
+  `ALLOW_OVERNIGHT=false` → flatten `SQUARE_OFF_MIN_BEFORE_SWAP` (default 15 min)
+  before server midnight. If `ALLOW_OVERNIGHT=true`, swap must be included in
+  the cost model and in live PnL (it arrives in `history_deals_get` as `swap`).
+- Do not trade the first `SKIP_MIN_AFTER_OPEN` (default 30) minutes after Monday
+  open and the last 30 before Friday close (spread blowout windows).
+- Volatility session flags (all as UTC, converted from the London/NY calendar):
+  `in_london (07:00–16:00 UTC)`, `in_ny (12:00–21:00 UTC)`,
+  `in_overlap (12:00–16:00 UTC)`. These replace v1's IST session features.
 
 ---
 
 ## 3. Repository layout to create
 
 ```
-common/
+common/                      # shared with future modules; NO Dhan imports here
 ├── __init__.py
-├── auth.py            # token store + RenewToken scheduler
-├── http.py            # REST wrapper: retry, backoff, circuit breaker, rate budget
-├── journal.py         # SQLite journal (shared schema, §11)
-└── alerts.py          # operator alerting (log CRITICAL + optional telegram/webhook stub)
+├── retry.py                 # retry/backoff + circuit breaker decorators
+├── journal.py               # SQLite journal (§11.1)
+└── alerts.py                # operator alerting (CRITICAL log + webhook stub)
 
 fx_commodities/
 ├── __init__.py
-├── config.py          # env-driven config object (§13)
-├── instruments.py     # §2
+├── config.py                # pydantic settings from .env (§13)
+├── instruments.py           # §2
+├── broker/
+│   ├── __init__.py
+│   ├── base.py              # BrokerAdapter Protocol + dataclasses (§4.6)
+│   └── mt5_adapter.py       # the only file importing MetaTrader5 (§4)
 ├── data/
 │   ├── __init__.py
-│   ├── feed.py        # market-feed websocket client (§4.1)
-│   ├── depth20.py     # 20-level depth client, NSE only (§4.2)
-│   ├── recorder.py    # tick + depth → Parquet (§4.3)
-│   ├── store.py       # query layer + historical backfill (§4.4)
-│   └── schemas.py     # PyArrow schemas (§4.5)
+│   ├── recorder.py          # tick/quote/DOM poller → Parquet (§4.3)
+│   ├── store.py             # readers + M1 backfill (§4.4)
+│   └── schemas.py           # PyArrow schemas (§4.5)
 ├── features/
 │   ├── __init__.py
-│   ├── bars.py        # tick → time/volume bars (§6)
-│   ├── orderflow.py   # aggressor, CVD, footprint, OFI (§7.1)
-│   ├── heatmap.py     # liquidity heatmap 5-and-20-level (§7.2)
-│   ├── volume_profile.py  # POC/VAH/VAL, VWAP (§7.3)
-│   └── indicators.py  # DEMA, ATR, ADX, Hurst, Yang-Zhang (§7.4)
-├── model/
-│   ├── __init__.py
-│   ├── labeling.py    # triple-barrier labels (§8.1)
-│   ├── dataset.py     # feature matrix assembly, purged splits (§8.2)
-│   ├── train.py       # LightGBM + isotonic calibration (§8.3)
-│   ├── kalman.py      # trend-state filter (§8.4)
-│   └── ensemble.py    # layer composition → signal (§9)
+│   ├── bars.py              # tick → time/volume bars (§6)
+│   ├── orderflow.py         # adaptive orderflow (§7.1)
+│   ├── quote_dynamics.py    # spread/quote-intensity features (§7.2)
+│   ├── heatmap.py           # DOM heatmap, only where has_dom (§7.3)
+│   ├── volume_profile.py    # POC/VAH/VAL, VWAP on tick_volume (§7.4)
+│   └── indicators.py        # DEMA, ATR, ADX, Hurst, Yang-Zhang (§7.5)
+├── model/                   # unchanged in structure from v1
+│   ├── labeling.py          # triple-barrier (§8.1)
+│   ├── dataset.py           # purged CV assembly (§8.2)
+│   ├── train.py             # LightGBM + isotonic (§8.3)
+│   ├── kalman.py            # trend filter (§8.4)
+│   └── ensemble.py          # decision logic (§9.1)
 ├── backtest/
-│   ├── __init__.py
-│   ├── engine.py      # event-driven backtester (§10)
-│   ├── costs.py       # Indian F&O cost model (§10.2)
-│   └── walkforward.py # rolling train/test + report (§10.3)
+│   ├── engine.py            # event-driven engine (§10.1)
+│   ├── costs.py             # spread+commission+swap model (§10.2)
+│   └── walkforward.py       # rolling evaluation + gate (§10.3)
 ├── execution/
-│   ├── __init__.py
-│   ├── risk.py        # sizing, limits, correlation guard (§9.3)
-│   └── executor.py    # order lifecycle + reconciliation (§11)
-├── signals.py         # Signal dataclass + emitters (§9.4)
-├── trader.py          # live loop entrypoint
-├── paper.py           # paper-trading harness (§14 Phase 4)
+│   ├── risk.py              # sizing, limits, correlation guard (§9.3)
+│   └── executor.py          # order lifecycle + reconciliation (§11)
+├── signals.py               # Signal dataclass + emitters (§9.4)
+├── trader.py                # live loop
+├── paper.py                 # paper harness (§14 Phase 4)
 ├── requirements.txt
 ├── .env.example
-└── tests/             # pytest; every module gets unit tests
+├── RUNBOOK.md               # §15
+└── tests/
 ```
 
-Dependencies (`fx_commodities/requirements.txt`): `websockets, pandas, numpy,
-pyarrow, lightgbm, scikit-learn, pydantic, python-dotenv, pytz, requests,
-fastapi, uvicorn` (fastapi/uvicorn only for the health endpoint).
+Dependencies: `MetaTrader5; platform_system=="Windows"`, `pandas, numpy, pyarrow,
+lightgbm, scikit-learn, pydantic, pydantic-settings, python-dotenv, requests,
+fastapi, uvicorn, pytest` (fastapi/uvicorn only for the health endpoint).
 
 ---
 
-## 4. Data layer specification
+## 4. Broker & data layer
 
-### 4.1 `data/feed.py`
+### 4.0 Capability probe (Phase 1, runs once per broker)
 
-- `class MarketFeed`: async client on `websockets`. Constructor takes
-  `list[Contract]`, mode (`FULL` default), and an async callback
-  `on_packet(pkt: ParsedPacket)`.
-- Parses all packet types in §1.1 via `struct.unpack_from('<...')`. Include a
-  pure function `parse_packet(buf: bytes) -> ParsedPacket` so parsing is unit-
-  testable against fixture bytes (write fixtures by hand from the tables in §1.1).
-- Chunk subscriptions at 100 instruments/message.
-- Reconnect: exponential backoff 1 s → 60 s cap, jittered; resubscribe all on
-  reconnect; log a `feed_gap` event with wall-clock gap duration into the journal
-  (backtests must know where data holes are).
-- Maintain per-instrument `last_packet_at`; a watchdog task logs WARNING if a
-  tradeable instrument is silent > 60 s during its session.
+`python -m fx_commodities.broker.probe` writes `reports/capabilities.json`:
 
-### 4.2 `data/depth20.py`
+```json
+{"EURUSD": {"broker_symbol": "EURUSD", "has_dom": false,
+             "has_last_ticks": false, "has_real_volume": false,
+             "tick_history_days": 90, "m1_history_days": 2200,
+             "median_spread_points": 6, "filling_modes": ["IOC"]}, ...}
+```
 
-- Same skeleton as feed.py, URL/header/payload per §1.2.
-- Builds `OrderBook20` per instrument: apply bid message (code 41) and ask
-  message (code 51); a snapshot is `clean` only when both sides have the same
-  or adjacent sequence numbers; otherwise `degraded`.
-- **Only subscribe NSE_CURRENCY contracts** (cap 50 — universe fits easily).
-- Emits `DepthSnapshot(ts, security_id, bids: list[Level], asks: list[Level],
-  clean: bool)` at most every `DEPTH_SNAPSHOT_INTERVAL_MS` (default 500 ms —
-  throttle, do not persist every update).
+Method: `symbol_info` + `market_book_add/get` (empty → no DOM) + sample
+`copy_ticks_range` over last week (any `TICK_FLAG_LAST` → has_last_ticks; any
+`volume_real > 0` → has_real_volume) + binary-search earliest available tick/M1.
+
+### 4.1 `broker/mt5_adapter.py`
+
+Implements `BrokerAdapter` (§4.6). Key requirements:
+
+- Single-threaded MT5 access (the package is not thread-safe): all calls funnel
+  through one worker thread with an internal queue; public methods are
+  thread-safe wrappers.
+- `stream_ticks(symbols)` generator: round-robin poll `copy_ticks_from` per
+  symbol using last `time_msc` watermark + 1 ms, `POLL_INTERVAL_MS` sleep per
+  full cycle; yields normalized `Tick` objects; dedupe on (symbol, time_msc,
+  bid, ask).
+- `stream_dom(symbols)`: for `has_dom` symbols only; snapshot via
+  `market_book_get` each poll cycle, throttled to `DOM_SNAPSHOT_INTERVAL_MS`
+  (default 500).
+- Health: `is_connected()` checks `terminal_info().connected and
+  account_info() is not None`; auto-`initialize()` retry with backoff on drop.
+
+### 4.2 Normalized broker types (`broker/base.py`)
+
+```python
+class Tick(NamedTuple):
+    ts_ms: int; symbol: str; bid: float; ask: float
+    last: float | None; volume: float | None      # None when broker gives no trades
+    side: int                                      # +1/-1 from flags BUY/SELL, else 0
+
+class DomLevel(NamedTuple):  side: int; price: float; volume: float
+class Candle(NamedTuple):    ts: int; o: float; h: float; l: float; c: float
+                             tick_volume: int; spread_points: int; real_volume: int
+
+class OrderResult(NamedTuple): ok: bool; retcode: int; deal_id: int | None
+                               fill_price: float | None; message: str
+
+class BrokerAdapter(Protocol):
+    def candles(self, symbol, timeframe_min, count, from_ts=None) -> list[Candle]: ...
+    def stream_ticks(self, symbols) -> Iterator[Tick]: ...
+    def stream_dom(self, symbols) -> Iterator[tuple[str, list[DomLevel]]]: ...
+    def market_order(self, symbol, side, lots, sl, tp, comment) -> OrderResult: ...
+    def modify_sltp(self, ticket, sl, tp) -> OrderResult: ...
+    def close_position(self, ticket, lots=None) -> OrderResult: ...
+    def positions(self, magic=None) -> list[Position]: ...
+    def deals(self, from_ts, to_ts, magic=None) -> list[Deal]: ...
+    def account(self) -> AccountInfo: ...
+```
+
+Strategy/risk/backtest code imports only these types (constraint D4).
 
 ### 4.3 `data/recorder.py`
 
-Standalone process: `python -m fx_commodities.data.recorder`.
+Standalone process (`python -m fx_commodities.data.recorder`), runs 24/5:
 
-- Subscribes Full feed for the whole universe + depth20 for NSE currency.
-- Buffers rows in memory; flushes to Parquet every `FLUSH_INTERVAL_S` (default
-  60 s) — append via new row-group files, one file per flush:
-  `data_root/{table}/symbol={key}/date={YYYY-MM-DD}/part-{HHMMSS}.parquet`.
-- Tables: `ticks`, `quotes`, `depth5`, `depth20`, `oi` (schemas §4.5).
-- On SIGTERM: flush and exit cleanly.
-- Must survive the full MCX session unattended (09:00–23:55). Log heartbeat
-  with row counts every 5 min.
-- Crash-safety: a partially written file is discarded on next startup if its
-  footer is invalid (validate on boot, quarantine to `_corrupt/`).
+- Consumes `stream_ticks` (all symbols) + `stream_dom` (DOM symbols).
+- Buffers → Parquet flush every `FLUSH_INTERVAL_S=60`:
+  `data_root/{table}/symbol={key}/date={YYYY-MM-DD}/part-{HHMMSS}.parquet`
+  (dates in UTC).
+- Tables: `ticks`, `dom` (§4.5). No separate quote table — FX ticks are quotes.
+- Heartbeat log with per-symbol row counts every 5 min; `feed_gap` journal event
+  when a symbol is silent > 120 s during market hours (FX is never silent that
+  long — it means the poll loop or terminal died).
+- Clean SIGTERM flush; corrupt-file quarantine on boot (validate footers).
 
 ### 4.4 `data/store.py`
 
-- `read_ticks(key, date_from, date_to) -> pd.DataFrame` etc., one reader per table.
-- `backfill_ohlcv(contract, interval, years) -> pd.DataFrame`: paginate
-  `POST /charts/intraday` in ≤ 90-day windows; de-duplicate on timestamp; persist
-  to `ohlcv` Parquet table so backfills are incremental.
-- All readers return timezone-aware IST timestamps.
+- `read_ticks/read_dom(key, date_from, date_to) -> pd.DataFrame` (UTC tz-aware).
+- `backfill_m1(contract, years=3)`: paginate `copy_rates_from_pos` /
+  `copy_rates_range` into the `ohlcv` table; incremental and idempotent.
 
-### 4.5 Parquet schemas (`data/schemas.py`, PyArrow)
+### 4.5 Parquet schemas
 
 ```
-ticks:   ts (timestamp[us, tz=Asia/Kolkata]), security_id int32, ltp float32,
-         ltq int32, side int8 (+1 buy-aggressor / -1 sell / 0 unknown, §7.1)
-quotes:  ts, security_id, bid float32, ask float32, bid_qty int32, ask_qty int32,
-         volume int32, atp float32, total_buy_qty int32, total_sell_qty int32
-depth5:  ts, security_id, level int8 (0-4), bid_px float32, bid_qty int32,
-         bid_orders int16, ask_px float32, ask_qty int32, ask_orders int16
-depth20: ts, security_id, side int8 (+1 bid/-1 ask), level int8 (0-19),
-         px float64, qty int32, orders int32, seq int64, clean bool
-oi:      ts, security_id, oi int32
-ohlcv:   ts, security_id, interval int8, open/high/low/close float32,
-         volume int64, oi int64
+ticks: ts_ms int64, symbol_key string, bid float64, ask float64,
+       last float64 (nullable), volume float64 (nullable), side int8
+dom:   ts_ms int64, symbol_key string, side int8, level int8,
+       price float64, volume float64
+ohlcv: ts int64, symbol_key string, tf_min int16, o/h/l/c float64,
+       tick_volume int64, spread_points int32, real_volume int64
 ```
+
+### 4.6 (merged into 4.2)
 
 ---
 
 ## 5. (reserved)
 
-Numbering gap intentional — kept for future amendments without renumbering.
-
 ---
 
 ## 6. Bars (`features/bars.py`)
 
-- `time_bars(ticks, quotes, interval_s) -> pd.DataFrame` with columns:
-  `open, high, low, close, volume, buy_volume, sell_volume, delta
-  (= buy_volume − sell_volume), n_trades, vwap, ts_open, ts_close`.
-- Bars are built strictly from **exchange timestamps**, aligned to wall-clock
-  boundaries (e.g. a 60 s bar covers [10:01:00, 10:02:00)). Never from arrival time.
-- Also implement `volume_bars(ticks, bucket_volume)` — used by the model layer
-  (volume bars have better statistical properties for ML labels).
+- `time_bars(ticks, interval_s)` on **mid price** (`(bid+ask)/2`), columns:
+  `open, high, low, close, tick_count, tick_volume, spread_mean_points,
+  spread_max_points, delta*, buy_ticks*, sell_ticks*, vwap*` — starred columns
+  computed per the orderflow availability rules in §7.0/§7.1.
+- Strictly exchange/broker timestamps (`time_msc`), aligned to UTC wall-clock
+  boundaries. `volume_bars(ticks, bucket)` on tick_volume for the model layer.
 
 ---
 
-## 7. Feature engineering — exact definitions
+## 7. Feature engineering
 
-Every feature function is pure (`DataFrame in → Series/DataFrame out`), unit-
-tested against small hand-computed fixtures. **No feature may look ahead**: value
-at bar *t* uses only data with `ts < t.close`. A dedicated test asserts this by
-recomputing features on truncated data.
+### 7.0 Feature availability policy (critical, new in v2)
 
-### 7.1 Orderflow (`features/orderflow.py`)
+Retail FX is decentralized: most broker feeds carry **quotes only** (no trades,
+no real volume, no DOM). Features therefore come in tiers, gated per symbol by
+the capability probe:
 
-**Aggressor classification (tick rule + quote rule):** for each tick, using the
-prevailing best bid/ask (last quote with `ts ≤ tick.ts`):
-`side = +1` if `ltp ≥ ask`; `-1` if `ltp ≤ bid`; else tick rule: sign of
-`ltp − prev_ltp` (0 if unchanged, inherit previous side).
+| Tier | Requires | Features |
+|------|----------|----------|
+| T0 (always) | quotes | everything in §7.2, §7.4 (tick_volume-based), §7.5 |
+| T1 | `has_last_ticks` | true aggressor CVD, footprint, absorption (§7.1) |
+| T2 | `has_dom` | DOM heatmap, walls, depth imbalance (§7.3) |
 
-**CVD:** `cvd_t = Σ (side_i × ltq_i)` cumulative within session. Feature columns:
-`cvd`, `cvd_slope_n` (linear-regression slope over last n bars), and
-`cvd_divergence`: sign(price change over n bars) ≠ sign(cvd change over n bars).
+`dataset.py` builds per-symbol feature matrices using only available tiers, and
+records the tier set in `dataset_version`. The model for a T0-only symbol simply
+has fewer columns — **never impute fake orderflow**.
 
-**Footprint per bar:** aggregate per price level within the bar:
-`buy_vol[p], sell_vol[p]`. Derived:
-- *Diagonal imbalance*: `buy_vol[p] ≥ IMBALANCE_RATIO × sell_vol[p − tick]`
-  (default ratio 3.0). Count of stacked imbalances (≥ 3 consecutive levels)
-  per side per bar.
-- *Absorption*: total bar volume in top quintile of trailing 20-bar volumes AND
-  bar range ≤ 0.25 × ATR(14) → flag.
+### 7.1 Orderflow (`features/orderflow.py`) — T1, plus T0 fallback
 
-**OFI (order flow imbalance, Cont–Kukanov–Stoikov):** on each best-quote update:
+- **True aggressor (T1):** `side` from `TICK_FLAG_BUY/SELL`; CVD, footprint
+  diagonal imbalances (ratio ≥ 3.0, stacked ≥ 3), absorption — formulas
+  identical to v1 (kept: CVD slope over n bars, CVD/price divergence flag).
+- **Quote-based proxy delta (T0 fallback, separate column names —
+  `pdelta_*`):** classify each quote tick by mid-price tick rule (+1 up-move,
+  −1 down-move, inherit on unchanged), weight = 1 (tick count). This measures
+  directional quote pressure, not traded volume — name it honestly, and let
+  feature importance decide if it earns its place.
 
-```
-e_n = 1{bid_n ≥ bid_{n-1}}·bidqty_n − 1{bid_n ≤ bid_{n-1}}·bidqty_{n-1}
-    − 1{ask_n ≤ ask_{n-1}}·askqty_n + 1{ask_n ≥ ask_{n-1}}·askqty_{n-1}
-OFI_bar = Σ e_n over the bar
-```
+### 7.2 Quote dynamics (`features/quote_dynamics.py`) — T0, new in v2
 
-Feature columns: `ofi`, `ofi_zscore` (vs trailing 100 bars).
+Per bar:
+- `spread_mean_pct, spread_std, spread_z` (vs trailing 200 bars) — spread
+  widening precedes news moves and fades.
+- `quote_intensity` = ticks/second; `intensity_z`.
+- `microprice_pressure` = mean of `(bid_size×ask + ask_size×bid)/(bid_size+ask_size) − mid`
+  when tick sizes present, else omitted.
+- `updown_ratio` = up-ticks / down-ticks over the bar.
 
-### 7.2 Liquidity heatmap (`features/heatmap.py`)
+### 7.3 DOM heatmap (`features/heatmap.py`) — T2 only
 
-Works on either `depth20` (NSE currency) or `depth5` (MCX) — the constructor
-takes `n_levels` and behaves identically otherwise.
+Same design as v1 (rolling price×time resting-liquidity matrix, wall detection at
+95th percentile persisting ≥ 10 bars, pull/stack score, depth imbalance), built
+from `dom` snapshots. Exports `dist_to_support_atr, dist_to_resistance_atr,
+support_strength, resistance_strength, depth_imbalance, pull_stack_score`.
 
-- Maintain a rolling matrix `H[price_bucket, t]` of resting quantity over the
-  last `HEATMAP_WINDOW_BARS` bars (price bucketed to tick size × bucket factor).
-- **Wall detection:** a price bucket whose average resting qty over the window
-  is ≥ `WALL_PERCENTILE` (default 95th) of all buckets, persisting ≥
-  `WALL_MIN_BARS` bars → emit as support (bid side) / resistance (ask side)
-  level with strength score = qty percentile.
-- **Pull/stack:** rate of change of qty at the 3 nearest levels each side;
-  `pull_ask` (ask liquidity withdrawing while price rises) is a bullish
-  confirmation feature; symmetric for bids.
-- **Depth imbalance:** `(Σ bid_qty − Σ ask_qty) / (Σ bid_qty + Σ ask_qty)` over
-  visible levels; feature per bar = time-weighted mean.
-- Feature columns exported per bar: `dist_to_support_atr, dist_to_resistance_atr,
-  support_strength, resistance_strength, depth_imbalance, pull_stack_score`.
+### 7.4 Volume profile & VWAP (`features/volume_profile.py`) — T0
 
-### 7.3 Volume profile & VWAP (`features/volume_profile.py`)
+As v1, but volume = `tick_volume` (or real volume where `has_real_volume`).
+Session = UTC day. Developing POC/VAH/VAL (70% value area), session VWAP ±1σ/±2σ
+computed on tick_volume weights. Exports `dist_to_poc_atr, above_vah, below_val,
+dist_to_vwap_sigma`.
 
-- Session volume profile from ticks: histogram of volume by price bucket.
-  `POC` = max-volume bucket; `VAH/VAL` = smallest price range around POC holding
-  70% of volume. Computed *developing* (recomputed each bar, using session-to-date
-  data only).
-- Session VWAP and ±1σ, ±2σ bands (σ = volume-weighted std of price).
-- Feature columns: `dist_to_poc_atr, above_vah (bool), below_val (bool),
-  dist_to_vwap_sigma`.
+### 7.5 Classical indicators (`features/indicators.py`) — T0
 
-### 7.4 Classical indicators (`features/indicators.py`)
+Unchanged from v1: DEMA(10/20/95) = `2·EMA − EMA(EMA)`, ATR(14) & ADX(14)
+Wilder, Yang-Zhang realized vol (20 bars), rolling Hurst (200 bars),
+minute-of-day sin/cos, plus the UTC session flags from §2.3.
 
-- **DEMA** `2·EMA(n) − EMA(EMA(n))` for n ∈ {10, 20, 95} (port from
-  `indices/indicators.py` — reimplement, do not import across modules).
-- **ATR(14)** Wilder. **ADX(14)** Wilder.
-- **Yang-Zhang realized volatility** over 20 bars (handles overnight gaps —
-  needed because MCX/US sessions create gaps for FX).
-- **Hurst exponent** via rescaled-range over rolling 200 bars.
-- Time features: minute-of-day sin/cos encoding, plus one-hot flags:
-  `in_london (13:30–16:30 IST)`, `in_ny_overlap (18:30–21:30 IST)`,
-  `mcx_evening (after 17:00 IST)`.
+**No-lookahead rule and test apply to every feature exactly as v1:** value at
+bar *t* uses only `ts < t.close`; `tests/test_no_lookahead.py` truncates input
+and asserts unchanged earlier values.
 
 ---
 
-## 8. Model layer
+## 8. Model layer (largely unchanged from v1)
 
-### 8.1 Labeling (`model/labeling.py`) — triple-barrier
+### 8.1 Triple-barrier labeling
+Upper `close + PT_MULT×ATR` (2.0), lower `close − SL_MULT×ATR` (1.0), vertical
+`MAX_HOLD_BARS` (60). `y ∈ {+1, −1, 0}`, record `t_touch`.
 
-For each bar *t* (on volume bars preferably, time bars acceptable for v1):
-- Upper barrier: `close_t + PT_MULT × ATR_t` (default PT_MULT = 2.0)
-- Lower barrier: `close_t − SL_MULT × ATR_t` (default SL_MULT = 1.0)
-- Vertical barrier: `t + MAX_HOLD_BARS` (default 60 bars)
-- Label `y = +1` if upper touched first, `−1` if lower first, `0` if vertical
-  expires first. Also record `t_touch` (needed for purging, §8.2).
-- Symmetric labels for shorts are implicit (predicting +1 means long edge;
-  −1 means short edge).
+### 8.2 Dataset
+Per-symbol matrices with tier-gated columns (§7.0) + symbol one-hot for pooled
+training. **Purged K-fold with embargo** (`EMBARGO_PCT=0.01`) exactly as v1 —
+overlapping-label leakage control is mandatory. Persist with `dataset_version`
+hash of (features, tiers, label params, date range).
 
-### 8.2 Dataset assembly (`model/dataset.py`)
+### 8.3 Training
+LightGBM (`num_leaves=31, max_depth=6, lr=0.05, n_estimators=400,
+min_child_samples=100, subsample=0.8, colsample_bytree=0.8`), tuned only via
+purged CV; isotonic calibration on a held-out fold; persist
+`models/{scope}/{dataset_version}/model.joblib` + `metrics.json` + feature-gain
+report (alert if one feature > 40% gain — leakage smell).
 
-- Feature matrix X: every column exported by §7 modules + `key` one-hot.
-- **Purged K-fold with embargo** (López de Prado): when splitting, drop any
-  training sample whose label window `[t, t_touch]` overlaps a test sample's
-  window; then embargo `EMBARGO_PCT` (default 1%) of samples after each test
-  block. This is mandatory — naive K-fold on overlapping labels is leakage.
-- Persist datasets to Parquet with a `dataset_version` hash of (feature list,
-  label params, date range).
-
-### 8.3 Training (`model/train.py`)
-
-- LightGBM binary classifier per direction (or single 3-class; implementer's
-  choice, justify in code docstring). Baseline hyperparameters:
-  `num_leaves=31, max_depth=6, learning_rate=0.05, n_estimators=400,
-  min_child_samples=100, subsample=0.8, colsample_bytree=0.8`. Tune only via
-  the purged CV of §8.2 — never on the walk-forward test windows.
-- **Isotonic calibration** on a held-out calibration fold: predicted 0.65 must
-  empirically mean ≈ 65%. Persist calibrated model with `joblib` to
-  `models/{key or 'pooled'}/{dataset_version}/model.joblib` + a `metrics.json`.
-- Class imbalance: use `scale_pos_weight` or class weights — vertical-barrier
-  zeros will dominate.
-- Feature importance report (gain) written next to the model; alert if a single
-  feature exceeds 40% of gain (usually leakage).
-
-### 8.4 Kalman trend filter (`model/kalman.py`)
-
-Local-linear-trend state space on bar closes:
-state `[level, velocity]`, `F = [[1,1],[0,1]]`, `H = [1,0]`. Process/observation
-noise `q, r` from config (`KALMAN_Q=1e-5, KALMAN_R=1e-2` defaults, per-instrument
-override). Outputs per bar: `kf_level, kf_velocity, kf_velocity_z` (z-scored).
-Used (a) as model features, (b) for trailing stops in §9.4.
+### 8.4 Kalman trend filter
+Local linear trend `[level, velocity]`, `F=[[1,1],[0,1]]`, `H=[1,0]`,
+`KALMAN_Q=1e-5, KALMAN_R=1e-2` per-symbol overridable. Outputs `kf_level,
+kf_velocity, kf_velocity_z`; used as features and for trailing stops.
 
 ---
 
 ## 9. Ensemble, risk, and signal output
 
-### 9.1 Decision logic (`model/ensemble.py`) — exact pseudocode
+### 9.1 Decision logic (`model/ensemble.py`)
 
 ```
-inputs per bar: p_up (calibrated), features row f, position state
-L0_long  = DEMA10 crossed above DEMA20 on this bar AND close > DEMA95
-L0_short = DEMA10 crossed below DEMA20 on this bar AND close < DEMA95
-L1_long  = p_up ≥ P_ENTRY            (default 0.60)
-L1_short = p_up ≤ 1 − P_ENTRY
-L2_long  = ofi_zscore > 0 AND cvd_slope_n > 0      # orderflow agrees
-L2_short = ofi_zscore < 0 AND cvd_slope_n < 0
-
-signal = BUY  if (L1_long  and L2_long)  or (L0_long  and L2_long)
-signal = SELL if (L1_short and L2_short) or (L0_short and L2_short)
+L0_long  = DEMA10 crossed above DEMA20 this bar AND close > DEMA95
+L0_short = DEMA10 crossed below DEMA20 this bar AND close < DEMA95
+L1_long  = p_up ≥ P_ENTRY (0.60)      L1_short = p_up ≤ 1 − P_ENTRY
+# Orderflow gate uses the best available tier:
+gate_long  = (T1: ofi/cvd_slope > 0) else (T0: pdelta_slope > 0 AND updown_ratio > 1)
+gate_short = symmetric
+signal = BUY  if (L1_long and gate_long)  or (L0_long and gate_long)
+signal = SELL if (L1_short and gate_short) or (L0_short and gate_short)
 else HOLD
-confidence = p_up if BUY else (1 − p_up) if SELL else 0.5
-# ML path and baseline path both require the orderflow gate. Baseline path
-# exists so the system still trades (with reduced size, §9.3) before/without
-# a trained model.
+confidence = p_up (BUY) / 1−p_up (SELL) / 0.5
 ```
 
-Exits: opposite ensemble signal, SL/TP touch, session-end square-off
-(`SQUARE_OFF_MIN_BEFORE_CLOSE`, default 10 min), or trailing stop
-(`kf_level − TRAIL_MULT × ATR` for longs once ≥ 1R in profit).
+Exits: opposite signal, native SL/TP touch (server-side), trailing stop —
+`modify_sltp(ticket, sl=kf_level − TRAIL_MULT×ATR)` for longs once ≥ 1R in
+profit — and the swap-avoidance square-off (§2.3) when `ALLOW_OVERNIGHT=false`.
 
 ### 9.2 Regime guard
-
-Skip all entries when: `ADX < 15` **and** `|hurst − 0.5| < 0.05` (dead chop), or
-when the instrument's realized spread over the last 30 min exceeds
-`MAX_LIVE_SPREAD_PCT` (default 0.08%).
+Skip entries when `ADX < 15 and |hurst − 0.5| < 0.05`, when live spread over the
+last 30 min > `MAX_LIVE_SPREAD_PCT`, when `spread_z > 3` (news blowout), and
+within `SKIP_MIN_AFTER_OPEN`/Friday-close windows (§2.3).
 
 ### 9.3 Risk & sizing (`execution/risk.py`)
 
-- Module capital: `capital = CAPITAL_TOTAL × ALLOC_FX_COMMODITIES`.
-- Per-trade risk budget: `risk_rupees = capital × RISK_PER_TRADE_PCT`
-  (default 0.5%).
-- Stop distance in rupees/lot: `stop_rupees = SL_MULT × ATR × rupee_value_per_point
-  × lot_size` (rupee value per point comes from `Contract`; for INR-quoted MCX
-  contracts it is direct, for cross pairs apply the USDINR conversion from the
-  live USDINR quote).
-- Lots: `floor(risk_rupees / stop_rupees)`, min 0, hard cap `MAX_LOTS` (default 4).
-- Kelly modulation: `size_mult = clip(2 × confidence − 1, 0, 1) × KELLY_FRACTION`
-  (default 0.5). Baseline-path trades (no ML) use `size_mult = 0.25` fixed.
-- Margin check: computed lots × margin-per-lot must fit within
-  `capital × MAX_MARGIN_UTILIZATION` (default 60%); query margin via Dhan fund
-  limits endpoint before entry, block if insufficient.
-- **Correlation guard**: instruments grouped by USD exposure sign:
-  `{long EURUSD, long GBPUSD, short USDJPY, long GOLDM, long SILVERM}` all imply
-  short-USD. Net same-direction USD-group positions capped at
-  `MAX_CORRELATED_POSITIONS` (default 2). Also global cap
-  `MAX_OPEN_POSITIONS` (default 3).
-- Loss limits: per-instrument daily loss `MAX_DAILY_LOSS_PER_INSTRUMENT_PCT`
-  (default 1% of capital), module daily loss `MAX_DAILY_LOSS_PCT` (default 2%);
-  breach ⇒ flatten (module-wide breach flattens everything) and halt entries
-  until next session. Halt state persists in the journal (survives restart).
+- `capital = CAPITAL_TOTAL × ALLOC_FX_COMMODITIES`; account currency conversion
+  via `account_info().currency` (assume USD account by default; if INR-funded
+  via broker, conversion handled by broker — use `account_info().balance`
+  directly and treat `CAPITAL_TOTAL` as account-currency).
+- `risk_amt = capital × RISK_PER_TRADE_PCT (0.5%)`.
+- Stop distance in account currency per lot:
+  `stop_value = (SL_MULT × ATR / tick_size) × tick_value`.
+- `lots = round_step(risk_amt / stop_value, volume_step)`, clipped to
+  `[volume_min, min(volume_max, MAX_LOTS=1.0)]`; if below `volume_min` → no trade.
+- Kelly modulation `size_mult = clip(2×confidence − 1, 0, 1) × KELLY_FRACTION
+  (0.5)`; baseline-path (L0) trades fixed `size_mult = 0.25`.
+- Margin pre-check via `order_check` — mandatory before every entry.
+- **Correlation guard (USD leg):** long EURUSD, long GBPUSD, short USDJPY, long
+  XAUUSD, long XAGUSD are all short-USD. Net same-direction USD-group entries
+  capped at `MAX_CORRELATED_POSITIONS=2`; global `MAX_OPEN_POSITIONS=3`.
+  WTI/NATGAS/COPPER count half-weight in the USD group.
+- Loss limits: per-symbol daily `1%`, module daily `2%` of capital (realized +
+  floating, computed from `positions()` + `deals()` each cycle). Breach ⇒
+  flatten module positions (by magic only!) + halt entries until next UTC day;
+  halt state persists in journal across restarts.
 
 ### 9.4 Signal schema (`signals.py`)
 
-```python
-@dataclass(frozen=True)
-class Signal:
-    ts: datetime            # bar close, IST
-    contract_key: str       # "GOLDM"
-    security_id: str
-    action: Literal["BUY", "SELL", "HOLD", "EXIT"]
-    confidence: float       # calibrated, 0..1
-    entry: float            # reference price (bar close)
-    stop_loss: float
-    target: float
-    lots: int
-    source: Literal["ensemble", "baseline", "risk_flatten", "session_end"]
-    features_digest: dict   # {p_up, ofi_z, cvd_slope, adx, hurst, spread_pct}
-```
-
-Every signal (including HOLDs when a position is open) is journaled. An optional
-`SIGNAL_WEBHOOK_URL` posts non-HOLD signals as JSON for the user's notification
-channel.
+As v1 with field renames: `contract_key → symbol_key`, `security_id →
+broker_symbol`; add `lots: float`, `tier: str` ("T0"/"T1"/"T2"). Every non-HOLD
+signal optionally POSTs to `SIGNAL_WEBHOOK_URL`.
 
 ---
 
 ## 10. Backtesting
 
-### 10.1 Engine (`backtest/engine.py`)
+### 10.1 Engine
+Event-driven over bars; **live and backtest call the identical
+`ensemble.decide()` / `risk.size()`**. Entry fills at `close + slippage`; SL/TP
+intra-bar conservative rule (both touched in one bar ⇒ SL first). Metrics: net
+PnL, profit factor, hit rate, avg win/loss, max DD, Sharpe, turnover, cost total.
 
-- Event-driven over bars (v1) with the same ensemble/risk code paths as live —
-  **the live trader and the backtester must call the identical
-  `ensemble.decide()` and `risk.size()` functions**. No duplicated logic.
-- Fills: market entry fills at `bar_close + slippage` (§10.2); SL/TP fills use
-  intra-bar OHLC conservative rules (if both SL and TP inside one bar, assume
-  SL hit first).
-- Outputs: trade list (entry/exit ts, prices, lots, costs, PnL), equity curve,
-  and metrics: net PnL, profit factor, hit rate, avg win/loss, max drawdown,
-  Sharpe (annualized on daily returns), turnover, total costs.
+### 10.2 Cost model (`backtest/costs.py`) — MT5 edition
 
-### 10.2 Cost model (`backtest/costs.py`)
+Per round trip, config-driven:
+- **Spread**: from recorded per-symbol, per-hour median spread (Phase 1 data);
+  applied as half-spread per side on mid-price fills. Fallback
+  `DEFAULT_SPREAD_POINTS` per symbol.
+- **Commission**: `COMMISSION_PER_LOT_SIDE` (default $3.5) × lots × 2.
+- **Swap**: if `ALLOW_OVERNIGHT`, apply `swap_long/short` points per night held,
+  ×3 on the triple-swap day.
+- **Slippage**: `DEFAULT_SLIPPAGE_POINTS=2` per side on top of spread (stress
+  test at 2× in the report).
 
-Per side, config-driven with these defaults (operator must verify against their
-Dhan contract note and update `.env`):
-- Brokerage: ₹20 flat per executed order
-- Exchange transaction charges: NSE currency futures ~0.00035% of turnover;
-  MCX futures ~0.0021% of turnover
-- SEBI fee 0.0001%, stamp duty 0.00015% (buy side), GST 18% on
-  (brokerage + transaction charges); CTT 0.01% on sell side for MCX non-agri
-- **Slippage**: half-spread per side, where spread = median recorded spread for
-  that instrument and time-of-day bucket (from Phase 1 recordings); fallback
-  `DEFAULT_SLIPPAGE_TICKS=1`.
-
-### 10.3 Walk-forward (`backtest/walkforward.py`)
-
-- Rolling: train 60 trading days → test 10 trading days → step 10. Minimum 6
-  test windows before any deployment decision.
-- Retrain (incl. recalibration) at every step; hyperparameters frozen across
-  steps (tuned only once, on the first train window, via purged CV).
-- Report: `reports/walkforward_{date}.json` + human-readable MD with per-window
-  and aggregate metrics, equity curve PNG.
-- **Deployment gate encoded in code**: `aggregate.profit_factor_after_costs ≥ 1.1`
-  and `max_drawdown ≤ 10% of module capital`. `trader.py --live` reads the latest
-  report and refuses to start otherwise.
+### 10.3 Walk-forward
+Train 60 trading days → test 10 → step 10; ≥ 6 windows; hyperparameters frozen
+after first-window purged-CV tune; recalibrate each step. Report JSON + MD +
+equity PNG in `reports/`. **Deployment gate in code**: aggregate
+`profit_factor_after_costs ≥ 1.1` AND `max_dd ≤ 10%` of module capital. The
+report must also show per-symbol breakdown — a symbol with PF < 1.0 gets dropped
+from the live universe (`reports/live_universe.json`).
 
 ---
 
 ## 11. Execution & journaling
 
-### 11.1 SQLite journal (`common/journal.py`), file `journal.db`
-
-```sql
-CREATE TABLE orders (
-  correlation_id TEXT PRIMARY KEY, order_id TEXT, ts_created TEXT NOT NULL,
-  module TEXT NOT NULL,            -- 'fx_commodities'
-  contract_key TEXT NOT NULL, security_id TEXT NOT NULL,
-  side TEXT NOT NULL, lots INTEGER NOT NULL, qty INTEGER NOT NULL,
-  order_type TEXT NOT NULL, limit_price REAL, trigger_price REAL,
-  status TEXT NOT NULL,            -- mirrors Dhan statuses
-  filled_qty INTEGER DEFAULT 0, avg_fill_price REAL, ts_terminal TEXT
-);
-CREATE TABLE positions (
-  id INTEGER PRIMARY KEY, contract_key TEXT, security_id TEXT,
-  direction TEXT, lots INTEGER, entry_price REAL, stop_loss REAL, target REAL,
-  ts_open TEXT, ts_close TEXT, exit_price REAL, realized_pnl REAL,
-  exit_reason TEXT, signal_json TEXT
-);
-CREATE TABLE risk_state (
-  session_date TEXT PRIMARY KEY, daily_pnl REAL, halted INTEGER,
-  halt_reason TEXT, updated_ts TEXT
-);
-CREATE TABLE events (
-  ts TEXT, level TEXT, kind TEXT, payload_json TEXT   -- feed_gap, reconcile_mismatch, ...
-);
-```
+### 11.1 SQLite journal (`common/journal.py`)
+Same DDL as v1 with columns renamed for MT5: `orders(correlation_id TEXT PK,
+ticket INTEGER, deal_id INTEGER, ...)`, `positions(ticket INTEGER, magic
+INTEGER, swap REAL, commission REAL, ...)`; `risk_state` and `events` tables
+unchanged. `session_date` keys on **UTC date**.
 
 ### 11.2 Order lifecycle (`execution/executor.py`)
 
-1. Insert journal row (status `LOCAL_NEW`) with fresh `correlation_id` **before**
-   calling Dhan. Duplicate correlation_id ⇒ refuse (idempotency).
-2. Place order; store `order_id`; poll `GET /orders/{id}` every 2 s until
-   terminal (max 60 s → alert + treat as unknown, reconcile).
-3. PnL only ever computed from **actual** `avg_fill_price × filled_qty`.
-4. Entry orders: MARKET. Protective stop: place a real `STOP_LOSS_MARKET` order
-   at the SL immediately after entry fill confirmation (never software-only
-   stops for MCX evening sessions — the process might die). Target: software-
-   managed; on target touch, cancel the SL order then flatten. On any flatten,
-   cancel outstanding protective orders first.
-5. **Startup reconciliation**: fetch Dhan positions; diff against `positions`
-   where `ts_close IS NULL`. Unknown broker position ⇒ CRITICAL alert + halt
-   (do not auto-flatten someone's manual trade). Journal position missing at
-   broker ⇒ mark closed with reason `reconcile_lost`, alert.
+1. Journal `LOCAL_NEW` row with fresh `correlation_id` (`fxc-{yyyymmdd}-{seq}`,
+   goes in MT5 `comment`) **before** sending. Duplicate id ⇒ refuse.
+2. `order_check` → `order_send` with native `sl`/`tp` **in the same request** —
+   the position is never unprotected, even for a millisecond, and stops survive
+   our process dying (major improvement over v1's separate stop legs).
+3. On `TRADE_RETCODE_DONE`: fetch the deal via `history_deals_get`, journal
+   actual `fill_price, commission`; PnL only ever from deals history.
+4. Retcode handling per §1.5; requote (10004) → refresh price, retry once;
+   invalid stops (10016) → widen to `trade_stops_level` + 1 point, retry once;
+   autotrading disabled (10027) → CRITICAL alert, halt.
+5. **Account-mode awareness:** on NETTING accounts an opposite entry on the same
+   symbol nets — executor must check `positions()` first and use explicit
+   `close_position` for exits. On HEDGING accounts always pass `position=ticket`.
+   Mode read once from `account_info().margin_mode`.
+6. **Startup reconciliation:** `positions(magic=MAGIC)` vs journal open
+   positions. Broker position missing in journal ⇒ CRITICAL alert + halt (never
+   auto-close: manual trades have different magic, but a magic collision is
+   still possible). Journal position missing at broker ⇒ close in journal as
+   `reconcile_lost` (probably SL/TP hit while we were down — confirm via
+   `history_deals_get` and record the real exit).
+7. Poll cycle (every bar): refresh positions; if a position's SL/TP vanished
+   (broker maintenance edge case), re-apply via `modify_sltp`.
 
 ---
 
-## 12. Common infrastructure (`common/`)
+## 12. Common infrastructure
 
-### 12.1 `auth.py`
-
-Holds token in a small state file (`.token.json`, git-ignored) with expiry.
-Background renewal via `POST /RenewToken` every 12 h; on failure → CRITICAL
-alert with the runbook line "generate new token at web.dhan.co and restart".
-
-### 12.2 `http.py`
-
-`dhan_request(method, path, json, *, budget: str)`:
-- Retries on 429/5xx/timeouts: 3 attempts, backoff 1 s/2 s/4 s + jitter.
-- Circuit breaker per host: opens after 5 consecutive failures, half-open probe
-  after 30 s. While open, callers get `CircuitOpenError` — the trader treats
-  this as "cannot manage risk" and refuses **new entries** (exits still
-  attempted, once, directly).
-- Client-side rate budgets (token bucket): `orders: 5/s`, `data: 1/s`,
-  `option_chain: 1 per 3 s` (shared constants; conservative vs Dhan's limits).
-
-### 12.3 `alerts.py`
-
-`alert(level, msg, **ctx)` → structured CRITICAL log line + optional POST to
-`ALERT_WEBHOOK_URL` (Telegram bot / generic). Stub is fine; interface matters.
+- `common/retry.py`: `@with_retry(attempts=3, backoff=(1,2,4), jitter=True)` for
+  adapter calls; circuit breaker opens after 5 consecutive adapter failures →
+  new entries blocked (`CircuitOpenError`), exits still single-attempted.
+- Terminal watchdog thread: `is_connected()` every 10 s; disconnect > 60 s ⇒
+  alert. (Positions remain protected by server-side SL/TP — say this in the
+  alert text to keep the operator calm.)
+- `common/alerts.py`: `alert(level, msg, **ctx)` → structured log + optional
+  `ALERT_WEBHOOK_URL` POST (Telegram-compatible stub).
+- Health endpoint (FastAPI on `HEALTH_PORT=8081`): terminal connectivity, last
+  tick age per symbol, open positions, daily PnL, halt state.
 
 ---
 
-## 13. Configuration (`.env` spec — full list)
+## 13. Configuration (`.env` spec)
 
 ```
-# credentials
-DHAN_CLIENT_ID=            DHAN_ACCESS_TOKEN=
+# broker
+MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
+MT5_LOGIN=            MT5_PASSWORD=            MT5_SERVER=
+MAGIC=520025
+SYMBOL_MAP=EURUSD=EURUSD,GBPUSD=GBPUSD,USDJPY=USDJPY,XAUUSD=XAUUSD,XAGUSD=XAGUSD,WTI=USOIL,NATGAS=NATGAS,COPPER=COPPER
 # capital
-CAPITAL_TOTAL=500000       ALLOC_FX_COMMODITIES=0.50
-RISK_PER_TRADE_PCT=0.5     MAX_DAILY_LOSS_PCT=2.0
-MAX_DAILY_LOSS_PER_INSTRUMENT_PCT=1.0
-MAX_LOTS=4                 MAX_OPEN_POSITIONS=3   MAX_CORRELATED_POSITIONS=2
-MAX_MARGIN_UTILIZATION=0.6 KELLY_FRACTION=0.5
-# universe
-UNIVERSE=EURUSD,GBPUSD,USDJPY,USDINR,EURINR,GBPINR,JPYINR,GOLDM,SILVERM,CRUDEOILM,NATURALGAS,COPPER
-ROLLOVER_BUFFER_DAYS=2     MAX_MEDIAN_SPREAD_PCT=0.05  MAX_LIVE_SPREAD_PCT=0.08
+CAPITAL_TOTAL=500000  ALLOC_FX_COMMODITIES=0.50
+RISK_PER_TRADE_PCT=0.5  MAX_DAILY_LOSS_PCT=2.0  MAX_DAILY_LOSS_PER_SYMBOL_PCT=1.0
+MAX_LOTS=1.0  MAX_OPEN_POSITIONS=3  MAX_CORRELATED_POSITIONS=2  KELLY_FRACTION=0.5
+# universe / sessions
+UNIVERSE=EURUSD,GBPUSD,USDJPY,XAUUSD,XAGUSD,WTI,NATGAS,COPPER
+MAX_MEDIAN_SPREAD_PCT_FX=0.03  MAX_MEDIAN_SPREAD_PCT_CMD=0.06  MAX_LIVE_SPREAD_PCT=0.08
+ALLOW_OVERNIGHT=false  SQUARE_OFF_MIN_BEFORE_SWAP=15  SKIP_MIN_AFTER_OPEN=30
 # strategy / model
-BAR_INTERVAL_S=60          PT_MULT=2.0   SL_MULT=1.0   MAX_HOLD_BARS=60
-P_ENTRY=0.60               IMBALANCE_RATIO=3.0
-TRAIL_MULT=1.5             SQUARE_OFF_MIN_BEFORE_CLOSE=10
-KALMAN_Q=1e-5              KALMAN_R=1e-2
-EMBARGO_PCT=0.01
-# heatmap
-DEPTH_SNAPSHOT_INTERVAL_MS=500   HEATMAP_WINDOW_BARS=120
-WALL_PERCENTILE=95         WALL_MIN_BARS=10
+BAR_INTERVAL_S=60  PT_MULT=2.0  SL_MULT=1.0  MAX_HOLD_BARS=60  P_ENTRY=0.60
+IMBALANCE_RATIO=3.0  TRAIL_MULT=1.5  KALMAN_Q=1e-5  KALMAN_R=1e-2  EMBARGO_PCT=0.01
 # data
-DATA_ROOT=./data_root      FLUSH_INTERVAL_S=60
-# costs (verify against your contract note)
-BROKERAGE_PER_ORDER=20     DEFAULT_SLIPPAGE_TICKS=1
+DATA_ROOT=./data_root  FLUSH_INTERVAL_S=60  POLL_INTERVAL_MS=200  DOM_SNAPSHOT_INTERVAL_MS=500
+# costs
+COMMISSION_PER_LOT_SIDE=3.5  DEFAULT_SLIPPAGE_POINTS=2
 # ops
-TIMEZONE=Asia/Kolkata      ALERT_WEBHOOK_URL=    SIGNAL_WEBHOOK_URL=
-HEALTH_PORT=8081           LOG_LEVEL=INFO
+ALERT_WEBHOOK_URL=  SIGNAL_WEBHOOK_URL=  HEALTH_PORT=8081  LOG_LEVEL=INFO
 ```
-
-`config.py` loads this into a frozen pydantic settings object; missing
-credentials fail fast with a clear message.
 
 ---
 
-## 14. Build phases, deliverables, and acceptance gates
+## 14. Build phases and acceptance gates
 
-### Phase 1 — Data foundation (build first, everything depends on it)
-Deliverables: `common/` (auth, http, alerts), `instruments.py`, `data/*`,
-health endpoint, unit tests for packet parsing (binary fixtures!) and resolver.
-**Gate:** recorder runs 5 consecutive trading days across full MCX sessions with
-< 0.1% feed-gap time; spread report per contract produced
-(`reports/spread_report.md`) and the tradeable universe finalized per D1.
+### Phase 1 — Broker adapter + data foundation
+Deliverables: `common/`, `broker/base.py`, `broker/mt5_adapter.py`, capability
+probe, `instruments.py`, recorder, store + M1 backfill, health endpoint. Unit
+tests: adapter logic mocked (no terminal in CI), tick normalization, resolver.
+**Gate:** capability report exists; recorder ran 5 consecutive trading days with
+< 0.1% gap time; spread report per symbol/hour produced; universe finalized
+per D1; M1 backfill ≥ 3 years per symbol.
 
 ### Phase 2 — Features + baseline + backtester
-Deliverables: `features/*`, `bars.py`, backtest engine + cost model, baseline
-DEMA strategy running through the backtester on 2 years of backfilled OHLCV
-(features restricted to OHLCV-derivable ones for the historical period; orderflow
-features only over the recorded window).
-**Gate:** backtest report for the baseline exists; all feature unit tests and
-the no-lookahead test pass.
+Deliverables: `features/*` (tier-gated), bars, backtest engine + cost model,
+baseline DEMA through the backtester on 3 years of M1 (T0 features only for the
+historical span; tick-derived features over the recorded window).
+**Gate:** baseline backtest report; all feature unit tests + no-lookahead test
+green on Linux CI.
 
 ### Phase 3 — Model + walk-forward
-Deliverables: `model/*`, walk-forward runner + report.
-**Gate:** aggregate OOS profit factor after costs ≥ 1.1 and max DD ≤ 10% of
-module capital. If failed: iterate features/labels, or ship baseline-only mode
-at reduced size — do NOT lower the gate.
+**Gate:** OOS PF after costs ≥ 1.1, max DD ≤ 10%; per-symbol live universe
+written. Failed symbols dropped; if all fail, baseline-only mode at 0.25 size —
+never lower the gate.
 
 ### Phase 4 — Paper, then live
-Deliverables: `paper.py` (same loop as trader.py, orders simulated at live
-quotes + modeled slippage, journaled identically), `trader.py --live`.
-**Gate to live:** ≥ 10 paper sessions; paper profit factor within 30% of the
-backtest expectation; zero reconciliation mismatches; then live at
-`MAX_LOTS=1` for the first two weeks regardless of sizing output.
+`paper.py` uses the real adapter on a **demo account** (MT5 demo = identical
+API) — this is true paper trading with real broker fills. ≥ 10 sessions, PF
+within 30% of backtest, zero reconciliation mismatches. Then live with
+`MAX_LOTS=0.01` hard-clamped for the first two weeks regardless of sizing.
 
-### Testing requirements (all phases)
-- pytest; coverage of `features/`, `model/labeling`, `risk` ≥ 90% lines.
-- Binary parser fixtures constructed by hand from §1.1/§1.2 tables.
-- A `tests/test_no_lookahead.py` that truncates input data and asserts feature
-  values at earlier bars are unchanged.
-- Risk tests: daily-loss halt persists across simulated restart; correlation
-  guard blocks the 3rd same-direction USD position; sizing never exceeds caps.
+### Testing requirements
+pytest; ≥ 90% line coverage on `features/`, `model/labeling.py`,
+`execution/risk.py`; no-lookahead test; risk tests (halt persistence across
+restart, correlation guard blocks 3rd USD position, volume_step rounding never
+exceeds caps); adapter retcode-handling tests with mocked `order_send`.
 
 ---
 
-## 15. Operator runbook items (write as `fx_commodities/RUNBOOK.md`)
+## 15. Operator runbook (`RUNBOOK.md`)
 
-1. IP whitelisting at web.dhan.co before first order (7-day lock after change).
-2. Daily token flow and what the expiry alert means.
-3. How to start/stop recorder and trader (systemd units or `docker compose` —
-   provide one of them).
-4. What a `reconcile_mismatch` CRITICAL alert requires (manual position check).
-5. How to re-run walk-forward and interpret the deployment gate.
-6. Cost-model verification against the first real contract note.
+1. **Environment:** Windows VPS (recommended: same region as broker server for
+   latency), MT5 terminal installed + logged in, "Algo Trading" button enabled,
+   auto-start on reboot (Task Scheduler entries for terminal, recorder, trader).
+2. Broker selection guidance: prefer a regulated ECN/raw-spread broker; DOM and
+   last-trade data availability materially improve the feature set (§7.0) —
+   check with the capability probe on a demo account **before** funding.
+3. Demo → live promotion checklist (Phase 4 gate evidence).
+4. What each CRITICAL alert means and the required manual action
+   (reconcile_mismatch, autotrading-disabled 10027, terminal disconnected).
+5. Weekly: review `reports/` walk-forward drift; monthly: retrain schedule.
 
 ---
 
 ## 16. Explicitly out of scope (v1)
 
-- Options on FX/commodities (futures only).
-- Tick-level backtesting of the ML layer (bar-level with recorded-spread
-  slippage is the v1 standard).
-- Cross-venue data (no international FX feeds; Dhan/Indian exchanges only).
+- Options on FX/metals; only spot/CFD market orders + native SL/TP.
+- Additional broker adapters (OANDA/cTrader/IBKR) — the Protocol in §4.2 is
+  designed for them, but only `mt5_adapter.py` ships in v1.
+- Tick-level ML backtesting (bar-level with recorded-spread slippage is v1).
 - Any UI beyond the health endpoint and MD reports.
-- Modifying or migrating `indices/` (separate roadmap, PLAN.md Part 2).
+- Modifying `indices/` (it stays on Dhan; separate roadmap in PLAN.md Part 2).
