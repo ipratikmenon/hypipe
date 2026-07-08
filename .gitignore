@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+.token.json
+journal.db*
+data_root/
+reports/
+*.log
