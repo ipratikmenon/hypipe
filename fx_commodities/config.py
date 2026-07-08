@@ -108,6 +108,15 @@ class Settings:
     drift_psi_warn: float = _f("DRIFT_PSI_WARN", 0.25)
     drift_psi_features_block: int = _i("DRIFT_PSI_FEATURES_BLOCK", 6)
 
+    # zone-confirmation gate (§9.1b)
+    zone_width_atr: float = _f("ZONE_WIDTH_ATR", 0.25)
+    zone_round_grid_points: int = _i("ZONE_ROUND_GRID_POINTS", 0)  # 0 = off
+    n_confirm: int = _i("N_CONFIRM", 2)
+    confirm_violate_frac: float = _f("CONFIRM_VIOLATE_FRAC", 0.5)
+    entry_window_bars: int = _i("ENTRY_WINDOW_BARS", 3)
+    min_wick_ratio: float = _f("MIN_WICK_RATIO", 0.5)
+    pivot_n: int = _i("PIVOT_N", 3)
+
     # data
     data_root: Path = Path(os.getenv("DATA_ROOT", "./data_root"))
     flush_interval_s: int = _i("FLUSH_INTERVAL_S", 60)

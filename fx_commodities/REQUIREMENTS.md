@@ -490,6 +490,25 @@ Unchanged from v1: DEMA(10/20/95) = `2·EMA − EMA(EMA)`, ATR(14) & ADX(14)
 Wilder, Yang-Zhang realized vol (20 bars), rolling Hurst (200 bars),
 minute-of-day sin/cos, plus the UTC session flags from §2.3.
 
+### 7.6 Price zones (`features/zones.py`) — T0
+
+Support/resistance zones for the confirmation gate (§9.1b). A zone is a band,
+never a line: `Z = [center − w/2, center + w/2]` with `w = ZONE_WIDTH_ATR × ATR`
+(default 0.25) frozen at creation. Level sources, all computable at T0:
+
+- **Swing pivots (fractals):** bar *t* is a pivot high if `high_t` is the max of
+  `high_{t−n..t+n}` (n = 3). **A pivot at t is only knowable at t+n** — its
+  `detect_ts = t + n` and it must not exist in the feature matrix before then
+  (no-lookahead test covers this explicitly).
+- **Prior-session structure:** previous UTC day's POC, VAH, VAL, high, low.
+- **Round numbers:** price grid every `ZONE_ROUND_GRID_POINTS × point`
+  (0 disables).
+- **DOM walls** join the zone set on T2 symbols.
+
+Zone strength = number of independent sources within w/2 of the center + count
+of prior confirmed holds; a zone whose violation close occurs (see §9.1b) is
+marked broken and flips role (broken support → resistance candidate).
+
 **No-lookahead rule and test apply to every feature exactly as v1:** value at
 bar *t* uses only `ts < t.close`; `tests/test_no_lookahead.py` truncates input
 and asserts unchanged earlier values.
@@ -742,6 +761,55 @@ Exits: opposite signal, native SL/TP touch (server-side), trailing stop —
 `modify_sltp(ticket, sl=kf_level − TRAIL_MULT×ATR)` for longs once ≥ 1R in
 profit — and the swap-avoidance square-off (§2.3) when `ALLOW_OVERNIGHT=false`.
 
+### 9.1b Zone-confirmation entry gate (`confirmation.py`)
+
+**Rule (user requirement):** never enter on a live touch of a level. Require
+proof the zone holds — closed candles only — and enter on the bar *after*
+confirmation completes, accepting a worse price for a higher win probability.
+
+**State machine, per (zone, direction), driven only by CLOSED bars:**
+
+```
+IDLE ──(bar range intersects Z)──▶ TOUCHED
+TOUCHED / CONFIRMING:
+  a confirming close (support case): close > z_hi          (closed back above)
+                                     AND low ≥ z_lo − λ·w  (violation tolerance,
+                                                            λ = CONFIRM_VIOLATE_FRAC)
+  N_CONFIRM consecutive confirming closes (default 2), of which ≥ 1 must show a
+  defence wick: (close − low)/(high − low) ≥ MIN_WICK_RATIO (default 0.5)
+      ──▶ CONFIRMED: entry window opens for ENTRY_WINDOW_BARS bars (default 3);
+          fill at the NEXT bar's open. SL anchored beyond the zone:
+          sl = z_lo − λ·w − buffer;  never intrabar entries.
+  any close beyond z_lo − λ·w  ──▶ FAILED: zone marked broken, flips role.
+Resistance case is symmetric.
+```
+
+**The mathematics of trading confirmation.** Entering after confirmation is
+worse by `δ` (ATR units) — the drift from touch price to confirmed-entry open.
+With target `π` and stop `σ` both anchored to the zone, the delayed entry
+shrinks the reward to `π − δ` and widens the risk to `σ + δ`:
+
+```
+EV_touch     = p₀·π − (1−p₀)·σ − c
+EV_confirmed = p₁·(π − δ) − (1−p₁)·(σ + δ) − c
+EV_confirmed > EV_touch   ⟺   Δp = p₁ − p₀  >  δ / (π + σ)
+```
+
+(the p₁·δ terms cancel exactly). With the D5 barriers (π=0.8, σ=1.6) and a
+typical 2-bar confirmation drift δ ≈ 0.3 ATR, confirmation must add
+**≥ 12.5 percentage points of win probability** to pay for itself.
+
+**This is measured, not assumed:** the backtest engine records, for every zone
+touch, BOTH the hypothetical at-touch outcome and the confirmed-entry outcome
+(when confirmation completed), and the report prints empirical `p₀, p₁, Δp, δ`
+and `confirmation_value = Δp·(π+σ) − δ` per symbol. If confirmation_value ≤ 0
+on a symbol, the gate is disabled there — the math decides, not preference.
+
+**Global closed-bar rule (applies to every entry path, §10.1 amended):**
+signals are evaluated ONLY on completed bars; fills occur at the next bar's
+open plus slippage. The engine and the live trader share this rule so backtest
+and live behaviour cannot diverge on timing.
+
 ### 9.2 Regime guard
 Skip entries when `ADX < 15 and |hurst − 0.5| < 0.05`, when live spread over the
 last 30 min > `MAX_LIVE_SPREAD_PCT`, when `spread_z > 3` (news blowout), and
@@ -799,9 +867,12 @@ optionally POSTs to `SIGNAL_WEBHOOK_URL`.
 
 ### 10.1 Engine
 Event-driven over bars; **live and backtest call the identical
-`ensemble.decide()` / `risk.size()`**. Entry fills at `close + slippage`; SL/TP
+`ensemble.decide()` / `risk.size()`**. Signals evaluate on CLOSED bars only;
+entry fills at the **next bar's open** + slippage (§9.1b global rule). SL/TP
 intra-bar conservative rule (both touched in one bar ⇒ SL first). Metrics: net
-PnL, profit factor, hit rate, avg win/loss, max DD, Sharpe, turnover, cost total.
+PnL, profit factor, hit rate, avg win/loss, max DD, Sharpe, turnover, cost
+total — plus the confirmation study of §9.1b (`p₀, p₁, Δp, δ,
+confirmation_value` per symbol).
 
 ### 10.2 Cost model (`backtest/costs.py`) — MT5 edition
 
