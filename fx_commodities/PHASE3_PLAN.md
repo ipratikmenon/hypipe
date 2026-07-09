@@ -172,8 +172,18 @@ including metrics + confirmation_study. Smoke test with synthetic bars.
 FastAPI: GET / serves the static dashboard; GET /api/state returns JSON
 assembled from journal.db (open positions, today's signals+digests, risk
 state) and reports/ (gates, walk-forward, confirmation study, drift). The
-dashboard HTML already renders from a `window.HYPIPE_STATE` object — replace
-its demo payload with the /api/state response.
+dashboard HTML renders demo payloads inline — replace them with /api/state.
+
+**Price chart:** the committed page ships a hand-built SVG demo chart. In the
+real locally-served dashboard, replace it with **TradingView
+lightweight-charts** (open-source, Apache-2.0, `npm i lightweight-charts` or
+vendored single JS file — no TradingView account needed): candlestick series
+from `store.read_ohlcv`/live bars; `series.setMarkers` for entries/exits;
+`series.createPriceLine` for SL and TP (update the SL line as the trailing
+stop moves); the active zone as a translucent area series between z_lo/z_hi.
+Add GET /api/ohlcv?symbol=&from=&to= to feed it. (The full tradingview.com
+widget cannot overlay our trades — lightweight-charts can, which is why it
+is the chosen library.)
 
 ## Step 15 — Integration gate (Definition of Done for Phase 3)
 

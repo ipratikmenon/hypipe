@@ -55,11 +55,18 @@
   /* ── grid ── */
   main{display:grid;gap:14px;padding:16px 22px;max-width:1460px;margin:0 auto;
        grid-template-columns:360px 1fr 330px;
-       grid-template-areas:"signals equity ladder" "signals gates regime"
-                           "positions positions study" "drift drift study"}
+       grid-template-areas:"signals chart ladder" "signals equity regime"
+                           "gates gates study" "positions positions study"
+                           "drift drift drift"}
   @media (max-width:1100px){main{grid-template-columns:1fr;
-    grid-template-areas:"equity" "signals" "gates" "ladder" "regime"
-                        "positions" "study" "drift"}}
+    grid-template-areas:"chart" "signals" "gates" "ladder" "regime"
+                        "equity" "positions" "study" "drift"}}
+  #chart{grid-area:chart}
+  #chart svg{width:100%;height:280px;display:block}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:8px;
+          font-family:var(--mono);font-size:10.5px;color:var(--mut)}
+  .legend span{display:inline-flex;align-items:center;gap:5px}
+  .sw{width:14px;height:3px;display:inline-block}
   section{background:var(--panel);border:1px solid var(--hair);
           border-radius:4px;padding:14px 16px;min-width:0}
   section h2{margin:0 0 12px;font-size:11px;font-family:var(--mono);
@@ -216,6 +223,19 @@
     </div>
   </section>
 
+  <!-- ────────── price chart with trade overlay ────────── -->
+  <section id="chart">
+    <h2>BTCUSD · 1m <span class="sub num">zone hold → confirmed entry (live trade)</span></h2>
+    <svg id="candles" viewBox="0 0 760 280" role="img"
+         aria-label="1-minute candles with zone, entry, stop and target"></svg>
+    <div class="legend">
+      <span><span class="sw" style="background:color-mix(in srgb,var(--acc) 30%,transparent)"></span>zone 65,190–65,230 (prior-VAL + pivot ×2)</span>
+      <span><span class="sw" style="background:var(--long)"></span>entry 65,214.5</span>
+      <span><span class="sw" style="background:var(--short);height:1px;border-top:2px dashed var(--short);background:none"></span>stop → trailing</span>
+      <span><span class="sw" style="background:none;border-top:2px dashed var(--long)"></span>target 65,327.7</span>
+    </div>
+  </section>
+
   <!-- ────────── equity ────────── -->
   <section id="equity">
     <h2>Walk-forward equity <span class="sub num">6 windows · 142 OOS trades</span></h2>
@@ -358,6 +378,65 @@ serves this page and swaps the demo payload for <code>GET /api/state</code>
 digests §9.4, gates §10.3, confirmation study §9.1b, regime §8.3, drift §8.10.</footer>
 
 <script>
+  // ── demo candle chart with trade overlay ─────────────────────────────
+  // Step 14 swaps this for TradingView lightweight-charts fed by /api/state
+  // (markers = entries/exits, price lines = SL/TP, band = active zone).
+  (function () {
+    // hand-scripted narrative: drift down → zone touch (wick) → 2 confirming
+    // closes → entry next open → trail after +1R → riding toward target
+    const O = [355,352,349,344,340,336,330,326,322,318,314,309,305,300,296,
+               290,284,276,268,262,250,238,230,218,210,205,215,228,234,240,
+               247,252,257,250,255,262,268,275,281,288,295,301,296,303,309,
+               316,322,328];
+    const candles = O.map((o,i)=>{
+      const c = O[i+1] ?? o+6;
+      const wickDn = (i===22||i===23) ? 26 : 5 + (i*7)%6;
+      const wickUp = 4 + (i*5)%6;
+      return {o, c, h:Math.max(o,c)+wickUp, l:Math.min(o,c)-wickDn, i};
+    });
+    // price mapping: y px directly (already in px space, 65,xxx implied)
+    const X = i => 18 + i*15.5, W = 8;
+    const zoneTop = 232, zoneBot = 262;       // 65,230–65,190
+    const entryI = 26, entryY = 224;          // 65,214.5 at next open
+    const slY = 271, tpY = 96;                // initial SL / TP
+    const trail = [[34,258],[39,236],[46,214]];
+
+    const el = document.getElementById("candles");
+    let s = "";
+    // zone band
+    s += `<rect x="10" y="${zoneTop}" width="740" height="${zoneBot-zoneTop}"
+           fill="var(--acc)" opacity="0.14"/>`;
+    s += `<text class="axis" x="14" y="${zoneTop-4}" fill="var(--acc)">zone · support (held ×1)</text>`;
+    // grid
+    for (const gy of [60,120,180,240]) s += `<line x1="10" y1="${gy}" x2="750" y2="${gy}" stroke="var(--chartgrid)"/>`;
+    // candles
+    for (const k of candles) {
+      const up = k.c <= k.o;   // y-down: smaller y = higher price
+      const col = up ? "var(--long)" : "var(--short)";
+      const top = Math.min(k.o,k.c), h = Math.max(2, Math.abs(k.o-k.c));
+      s += `<line x1="${X(k.i)+W/2}" y1="${k.h- (k.h-Math.min(k.o,k.c))*2}" x2="${X(k.i)+W/2}" y2="${k.l}" stroke="${col}" stroke-width="1"/>`;
+      s += `<rect x="${X(k.i)}" y="${top}" width="${W}" height="${h}" fill="${col}" rx="0.5"/>`;
+    }
+    // confirming closes annotation
+    s += `<text class="axis" x="${X(24)-8}" y="${zoneBot+16}">touch</text>`;
+    s += `<text class="axis" x="${X(25)-14}" y="${zoneTop-24}">confirm 1·2</text>`;
+    // entry marker
+    s += `<path d="M${X(entryI)+W/2-7},${entryY+16} l7,-12 l7,12 z" fill="var(--long)"/>`;
+    s += `<text class="axis" x="${X(entryI)+14}" y="${entryY+14}" fill="var(--long)">BUY 65,214.5</text>`;
+    // SL: initial then trailing steps
+    s += `<line x1="${X(entryI)-6}" y1="${slY}" x2="${X(trail[0][0])}" y2="${slY}" stroke="var(--short)" stroke-width="1.5" stroke-dasharray="5 4"/>`;
+    for (let t=0;t<trail.length;t++){
+      const [ti,ty]=trail[t]; const next=trail[t+1];
+      s += `<line x1="${X(ti)}" y1="${trail[t-1]?trail[t-1][1]:slY}" x2="${X(ti)}" y2="${ty}" stroke="var(--short)" stroke-width="1" stroke-dasharray="2 3"/>`;
+      s += `<line x1="${X(ti)}" y1="${ty}" x2="${next?X(next[0]):750}" y2="${ty}" stroke="var(--short)" stroke-width="1.5" stroke-dasharray="5 4"/>`;
+    }
+    s += `<text class="axis" x="640" y="${trail[2][1]-6}" fill="var(--short)">trailing SL (kf − 1.5·ATR)</text>`;
+    // TP line
+    s += `<line x1="${X(entryI)-6}" y1="${tpY}" x2="750" y2="${tpY}" stroke="var(--long)" stroke-width="1.5" stroke-dasharray="5 4"/>`;
+    s += `<text class="axis" x="654" y="${tpY-6}" fill="var(--long)">TP 65,327.7</text>`;
+    el.innerHTML = s;
+  })();
+
   // demo DOM ladder — Step 14 replaces with /api/state book snapshot
   const rows = [
     [65232.0,null,3.1],[65228.5,null,2.2],[65225.0,null,4.8],[65221.5,null,1.9],
