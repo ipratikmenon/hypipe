@@ -100,6 +100,55 @@ Human approval is required for champion promotion initially
 promotions, the flag may be flipped to allow auto-promotion **to paper-vetted
 live at quarter size**, never to full size.
 
+### Level 2 implementation shape: AutoResearch, with one critical repair
+
+Karpathy's AutoResearch (2026) is the reference implementation pattern for
+this level: research directions written in a markdown file, an AI coding
+agent running short experiments back-to-back unattended, keeping winners, and
+leaving a git history of validated improvements plus a log of everything
+tried. We adopt its mechanics wholesale — **except its selection rule, which
+is fatal in markets.**
+
+**Why vanilla AutoResearch would blow up a trading system:** its loop keeps
+whatever beats the current best on the objective. That works when the eval is
+honest — validation loss on fixed data is cheap, clean, and hard to game. A
+*backtest* is none of those things: it is noisy, and "keep whatever beats the
+best" over hundreds of overnight trials is a machine for climbing into
+backtest overfit — it would manufacture exactly the beautiful fake that PSR/
+DSR exist to detect. The eval, not the agent, is the whole difference between
+automated research and automated self-deception.
+
+**The repair — hypipe's AutoResearch variant (`evolve/autoresearch/`):**
+1. `RESEARCH_DIRECTIONS.md` — the human-written direction file, exactly as
+   Karpathy's ("explore volatility-conditioned footprint imbalance windows",
+   "try alternative label geometries on T1 symbols"). The human's job shifts
+   from writing experiments to writing directions — that part carries over
+   unchanged.
+2. **Two-stage evals** (mirrors its 5-minute-experiment economics): a cheap
+   screen (single purged-CV window, minutes) kills ~90% of mutations; only
+   survivors get the full walk-forward.
+3. **Deflated selection instead of greedy selection:** a candidate is kept
+   NOT when it beats the best, but when it beats the champion by a margin
+   that **grows with the number of trials attempted** — every experiment
+   increments `trials.json`, and the acceptance threshold is the DSR-implied
+   expected-max-Sharpe of that many tries. Run 300 experiments overnight and
+   the bar rises accordingly; luck cannot accumulate.
+4. **Winners land as paper challengers** (Level 1 entry), never as commits to
+   the live path. The git-history-of-improvements lands in a research branch;
+   the Constitution files are read-only to the agent.
+5. **Two objective classes, two rulebooks:** *engineering objectives*
+   (backtest runtime, feature-compute speed, calibration ECE on frozen folds,
+   recorder robustness, test coverage) have honest evals — vanilla
+   AutoResearch greed is safe and encouraged there, and is where it should
+   run FIRST (it is applicable today, pre-evolution, on this repo). *Alpha
+   objectives* (anything whose eval is a backtest) always go through rules
+   2–4.
+6. Karpathy's stated next step — massively parallel, asynchronously
+   collaborative agents ("a research community, not a PhD student") — maps
+   onto Level 3: parallel workers exploring different feature families
+   against one shared trials ledger, so the deflation accounting spans the
+   whole community's search, not each worker's slice.
+
 ## Level 3 — Population methods (GPU research track, extends §8.11 R6/R7)
 
 - **Population-based training:** a population of model configs trains in
