@@ -12,7 +12,7 @@ global FX/bullion/commodities via MetaTrader 5.
 | [`overnight/`](overnight/REQUIREMENTS.md) | Spec complete | Dhan | Overnight-gap engine for NIFTY/BANKNIFTY/MIDCPNIFTY/FINNIFTY — 15:15 IST afternoon-session features → buy option at 15:20, sell at next open, gated by the theta-carry breakeven p* = ½(1+(Θ+c)/(Δ·S·g)); includes news/calendar tracking and the twice-daily signal report |
 | `common/` | Built | — | Shared plumbing: retry & circuit breaker, trade journal, alerting |
 
-See [PLAN.md](PLAN.md) for the full system audit, hardening roadmap, and the
+See [EVOLUTION.md](EVOLUTION.md) for the self-evolving research-loop design, and [PLAN.md](PLAN.md) for the full system audit, hardening roadmap, and the
 `fx_commodities/` design.
 
 ## Disclaimer
