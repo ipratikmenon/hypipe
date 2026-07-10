@@ -133,6 +133,43 @@ automated research and automated self-deception.
    increments `trials.json`, and the acceptance threshold is the DSR-implied
    expected-max-Sharpe of that many tries. Run 300 experiments overnight and
    the bar rises accordingly; luck cannot accumulate.
+
+3b. **The gratitude rule — non-greedy acceptance via incubation + SPRT.**
+   Deflation (3) fixes *how good* a result must look; this fixes *when we
+   believe it*. Analogy that motivated it: elastic hashing proves greedy
+   insertion (take the first open slot) is suboptimal — deliberate deferral
+   wins long-run. Same here: a positive result is never adopted on sight.
+
+   - A candidate that clears the deflated bar enters the **incubator** —
+     its evidence is banked (recorded, credited, not acted on), and it
+     keeps running.
+   - Markets deliver something static ML benchmarks cannot: **genuinely
+     fresh, unhackable out-of-sample data every week.** Each new week is one
+     independent trial for every incubator resident, at near-zero cost.
+   - Acceptance is a **Wald Sequential Probability Ratio Test** on the
+     weekly paper-PnL differences vs the champion, `d_i`:
+
+     ```
+     LLR_n = (δ*/σ²) · Σᵢ (d_i − δ*/2)          (Gaussian approximation)
+     accept  when LLR_n ≥ log((1−β)/α) ≈ +2.77   (α=0.05 false adoption)
+     kill    when LLR_n ≤ log(β/(1−α)) ≈ −1.56   (β=0.20 missed adoption)
+     otherwise: stay in the incubator and keep accumulating
+     ```
+
+     A real edge typically crosses the accept line in 4–10 weeks; a lucky
+     one drifts down and dies. SPRT is provably the fastest test with these
+     error guarantees — mathematically optimal patience.
+   - **Pattern-repetition requirement** (the user's "check it repeats"):
+     acceptance additionally requires wins distributed across conditions —
+     positive in ≥ 60% of incubation weeks AND in ≥ 2 of the 3 HMM regimes
+     encountered. One hot streak in one regime never qualifies.
+   - **Bounded patience:** max incubation age 12 weeks. Markets are
+     non-stationary — an idea still unproven after a quarter has missed its
+     regime, and holding it longer confuses patience with attachment. This
+     bound is the honest cost of the gratitude rule: it will occasionally
+     be slow to adopt a real edge. In trading the loss function is
+     asymmetric — a false adoption costs real money, a slow adoption costs
+     only opportunity — so patience is the correct bias.
 4. **Winners land as paper challengers** (Level 1 entry), never as commits to
    the live path. The git-history-of-improvements lands in a research branch;
    the Constitution files are read-only to the agent.
