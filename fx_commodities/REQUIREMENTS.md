@@ -602,6 +602,24 @@ Feature availability matrix (extends §7.0): `positioning` features are daily
 tier-D columns, present per symbol per the table above; absent columns are
 never imputed.
 
+### 7.9 Micro-window traits (`features/microstructure.py`) — T0/T1
+
+"Microstructure eyes, macro hands": traits that live in 1–30 second windows
+inside each bar, aggregated to bar close and consumed by minute-scale
+decisions. We never *act* at these timescales (§8.11 not-pursued list); we
+*sense* at them — micro information survives aggregation far better than the
+ability to trade on it.
+
+Per bar: `burst_ratio` (max 1-second arrival count / mean — a cheap Hawkes
+self-excitation proxy until R3 lands), `arrival_accel` (2nd-half/1st-half
+trade rate), `tick_run_max` (longest same-direction tick run), `flip_rate`
+(micro chop), `sweep_1s_max` (max price traversal inside any 1 s window —
+feeds §7.7 sweep detection), `micro_mom_eob` (signed move in the final 5 s —
+who won the close), `eob_delta_share` (T1: aggressor delta share of the final
+5 s), plus rolling z-scores for burst/sweep (the model consumes surprise, not
+level). Ticks stamped exactly at ts_close belong to the next bar — boundary
+inclusion is lookahead and is tested.
+
 **No-lookahead rule and test apply to every feature exactly as v1:** value at
 bar *t* uses only `ts < t.close`; `tests/test_no_lookahead.py` truncates input
 and asserts unchanged earlier values. For weekly/daily joined data (COT, GEX)
