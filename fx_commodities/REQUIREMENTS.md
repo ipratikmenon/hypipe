@@ -900,6 +900,21 @@ literature and industry practice: RL is productive for *order execution*
 frameworks) and unstable for signal generation. If we ever do RL, it
 optimizes fill quality against recorded books, never entry/exit decisions.
 
+**R10. Cross-venue mispricing in immature venues (research, unscheduled).**
+The one "fast trading" family genuinely open to solo operators — as
+demonstrated publicly by small stat-arb outfits — is NOT racing HFT firms on
+exchanges; it is arbitraging *young, structurally inefficient venues* against
+mature ones: prediction-market contracts vs their underlying reference prices
+(e.g. Polymarket outcome odds vs live equity/index prices), and crypto
+cross-exchange basis/latency spreads. The edge source is venue immaturity and
+slow participants, so millisecond engineering helps but nanoseconds are not
+required (NTP-synced seconds-scale is competitive). Honest constraints before
+this ever becomes a module: venue/counterparty risk, KYC/geo eligibility,
+fee-adjusted edges are thin, inventory management across venues is the real
+problem, and the edges decay as venues mature. Fits our stack naturally
+(BrokerAdapter per venue, R4 lead-lag machinery, same gates); prioritize only
+after core modules trade.
+
 **Explicitly not pursued (out of a single-operator's reach, stated so the
 roadmap stays honest):** colocation/FPGA latency arbitrage, queue-position
 games, maker-rebate harvesting, index-rebalance front-running at size. These
