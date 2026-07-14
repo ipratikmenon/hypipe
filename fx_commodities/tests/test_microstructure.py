@@ -11,7 +11,9 @@ T0 = 1_751_961_600_000
 
 def bar_frame(n_bars=1, interval_ms=60_000):
     ts = T0 + np.arange(n_bars) * interval_ms
-    return pd.DataFrame({"ts_open_ms": ts, "ts_close_ms": ts + interval_ms})
+    df = pd.DataFrame({"ts_open_ms": ts, "ts_close_ms": ts + interval_ms})
+    df["close"] = 100.0
+    return df
 
 
 def ticks(rows):
@@ -89,3 +91,47 @@ class TestMicroTraits:
             full.drop(columns=[c for c in full.columns if c.endswith("_z")]),
             trunc.drop(columns=[c for c in trunc.columns if c.endswith("_z")]).reset_index(drop=True),
             rtol=1e-12)
+
+
+class TestFootprint:
+    """Bid×ask footprint (§7.1) — hand-built grids force each signature."""
+
+    @staticmethod
+    def _ticks(rows):
+        return pd.DataFrame({
+            "ts_ms": [T0 + r[0] for r in rows],
+            "price": [r[1] for r in rows],
+            "side": [r[2] for r in rows],
+            "volume": [r[3] for r in rows],
+        })
+
+    def test_stacked_buy_imbalance_detected(self):
+        from fx_commodities.features.orderflow import footprint_features
+        # buyers 10x sellers on the diagonal at 3 consecutive levels
+        rows = []
+        for k, p in enumerate([100.0, 100.1, 100.2, 100.3]):
+            rows.append((1000 + k * 4000, p, -1, 1.0))        # tiny sells
+            rows += [(2000 + k * 4000 + i, p + 0.1, 1, 5.0) for i in range(2)]
+        tk = self._ticks(rows)
+        bars = bar_frame(1).assign(close=100.4)
+        fp = footprint_features(tk, bars, grid=0.1, imbalance_ratio=3.0)
+        assert fp["fp_buy_imb"].iloc[0] >= 3
+        assert fp["fp_stacked_buy"].iloc[0] >= 3
+        assert fp["fp_sell_imb"].iloc[0] == 0
+
+    def test_balanced_grid_shows_no_imbalance(self):
+        from fx_commodities.features.orderflow import footprint_features
+        rows = []
+        for k, p in enumerate([100.0, 100.1, 100.2]):
+            rows.append((1000 + k * 3000, p, 1, 5.0))
+            rows.append((1500 + k * 3000, p, -1, 5.0))
+        fp = footprint_features(self._ticks(rows), bar_frame(1).assign(close=100.1),
+                                grid=0.1)
+        assert fp["fp_buy_imb"].iloc[0] == 0
+        assert fp["fp_sell_imb"].iloc[0] == 0
+
+    def test_quotes_only_yields_nan_not_fake_orderflow(self):
+        from fx_commodities.features.orderflow import footprint_features
+        rows = [(i * 1000, 100.0 + 0.01 * i, 0, 1.0) for i in range(30)]
+        fp = footprint_features(self._ticks(rows), bar_frame(1), grid=0.1)
+        assert fp["fp_buy_imb"].isna().all()      # T0 → NaN, never imputed

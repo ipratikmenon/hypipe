@@ -76,3 +76,87 @@ def absorption_flag(bars: pd.DataFrame, atr: pd.Series,
     bar_range = bars["high"] - bars["low"]
     return ((bars["tick_volume"] >= vol_q80)
             & (bar_range <= range_frac * atr)).astype(int)
+
+
+# ── bid×ask footprint (§7.1) — per-price imbalance grid, bar-aggregated ─────
+
+def footprint_features(ticks: pd.DataFrame, bars: pd.DataFrame,
+                       grid: float, imbalance_ratio: float = 3.0,
+                       min_stack: int = 3) -> pd.DataFrame:
+    """The footprint chart, reduced to model-consumable numbers per bar.
+
+    For each bar, trades are bucketed to a price grid and split by aggressor
+    side. A BUY diagonal imbalance exists at level p when buy volume at p
+    ≥ ratio × sell volume at (p − grid) — buyers lifting offers faster than
+    sellers defend one tick below (SELL case symmetric, one tick above).
+    Boxed-cells-in-a-column becomes: count of imbalances and the longest
+    same-side stack. Requires T1 ticks (side ≠ 0); bars without trade data
+    yield NaN — never imputed.
+
+    Exports per bar: fp_buy_imb, fp_sell_imb (level counts),
+    fp_stacked_buy, fp_stacked_sell (longest consecutive runs),
+    fp_poc_dist_ticks (bar's max-volume price vs close, in grid units).
+    """
+    out_cols = ("fp_buy_imb", "fp_sell_imb", "fp_stacked_buy",
+                "fp_stacked_sell", "fp_poc_dist_ticks")
+    t = ticks[(ticks.get("side", 0) != 0)].copy() if "side" in ticks.columns \
+        else ticks.iloc[0:0]
+    if t.empty or grid <= 0:
+        return pd.DataFrame(np.nan, index=bars.index, columns=list(out_cols))
+
+    px = (t["last"].fillna((t["bid"] + t["ask"]) / 2)
+          if "last" in t.columns else t["price"]).to_numpy(float)
+    ts = t["ts_ms"].to_numpy(np.int64)
+    side = t["side"].to_numpy(np.int64)
+    vol = (t["volume"].fillna(1.0).to_numpy(float)
+           if "volume" in t.columns else np.ones(len(t)))
+    order = np.argsort(ts)
+    ts, px, side, vol = ts[order], px[order], side[order], vol[order]
+    levels_all = np.round(px / grid).astype(np.int64)
+
+    rows = []
+    for _, b in bars.iterrows():
+        i = np.searchsorted(ts, int(b["ts_open_ms"]), side="left")
+        j = np.searchsorted(ts, int(b["ts_close_ms"]), side="left")
+        if j - i < 2:
+            rows.append(dict.fromkeys(out_cols, np.nan))
+            continue
+        lv, sd, v = levels_all[i:j], side[i:j], vol[i:j]
+        lo, hi = lv.min(), lv.max()
+        n_lv = hi - lo + 1
+        buy = np.zeros(n_lv)
+        sell = np.zeros(n_lv)
+        np.add.at(buy, lv[sd > 0] - lo, v[sd > 0])
+        np.add.at(sell, lv[sd < 0] - lo, v[sd < 0])
+
+        # diagonal comparisons: buy[p] vs sell[p-1]; sell[p] vs buy[p+1]
+        buy_imb = np.zeros(n_lv, dtype=bool)
+        sell_imb = np.zeros(n_lv, dtype=bool)
+        if n_lv >= 2:
+            opp_dn = sell[:-1]
+            buy_imb[1:] = (buy[1:] > 0) & (buy[1:] >= imbalance_ratio *
+                                           np.where(opp_dn > 0, opp_dn, 1e-12)) \
+                          & ((opp_dn > 0) | (buy[1:] >= v.mean()))
+            opp_up = buy[1:]
+            sell_imb[:-1] = (sell[:-1] > 0) & (sell[:-1] >= imbalance_ratio *
+                                               np.where(opp_up > 0, opp_up, 1e-12)) \
+                            & ((opp_up > 0) | (sell[:-1] >= v.mean()))
+
+        def _longest(mask: np.ndarray) -> int:
+            best = cur = 0
+            for m in mask:
+                cur = cur + 1 if m else 0
+                best = max(best, cur)
+            return best
+
+        total = buy + sell
+        poc_level = lo + int(np.argmax(total))
+        close_level = int(round(b["close"] / grid))
+        rows.append({
+            "fp_buy_imb": float(buy_imb.sum()),
+            "fp_sell_imb": float(sell_imb.sum()),
+            "fp_stacked_buy": float(_longest(buy_imb)),
+            "fp_stacked_sell": float(_longest(sell_imb)),
+            "fp_poc_dist_ticks": float(close_level - poc_level),
+        })
+    return pd.DataFrame(rows, index=bars.index)
