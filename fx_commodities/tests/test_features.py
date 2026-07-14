@@ -150,3 +150,50 @@ class TestVolumeProfile:
         prior = prior_session_levels(vp)
         assert prior.iloc[0].isna().all()            # day 1 has no prior
         assert prior.iloc[1].notna().any()
+
+
+class TestDeltaAndPressure:
+    def test_delta_change_and_flip_detection(self):
+        bars = bar_frame(300)
+        # plant real aggressor delta with one violent sign flip
+        delta = np.full(300, 50.0)
+        delta[200] = 800.0          # buyers surge
+        delta[201] = -900.0         # control flips hands violently
+        bars["delta"] = delta
+        bars["buy_ticks"] = np.where(delta > 0, np.abs(delta), 0.0)
+        bars["sell_ticks"] = np.where(delta < 0, np.abs(delta), 0.0)
+        out = add_orderflow(bars)
+        assert out["delta_change"].iloc[201] == pytest.approx(-1700.0)
+        assert out["delta_flip"].iloc[201] == 1
+        assert out["delta_flip"].iloc[100] == 0
+
+    def test_buy_pressure_pct_reads_correctly(self):
+        bars = bar_frame(100)
+        bars["delta"] = 10.0
+        # 1/3 buying over the window → ~33%
+        bars["buy_ticks"] = 10.0
+        bars["sell_ticks"] = 20.0
+        out = add_orderflow(bars)
+        assert out["buy_pressure_pct"].iloc[-1] == pytest.approx(33.33, abs=0.1)
+
+    def test_buy_pressure_t0_fallback_uses_tick_counts(self):
+        bars = bar_frame(100)   # no delta/buy_ticks columns → T0 path
+        bars["up_ticks"] = 30
+        bars["down_ticks"] = 10
+        out = add_orderflow(bars)
+        assert out["buy_pressure_pct"].iloc[-1] == pytest.approx(75.0, abs=0.1)
+
+
+class TestZoneReport:
+    def test_supply_demand_table(self):
+        from fx_commodities.features.zones import ZoneSet
+        zs = ZoneSet(width_atr=0.25)
+        zs._add_zone(98.0, "support", "prior_val", atr=2.0, ts_ms=1)
+        zs._add_zone(103.0, "resistance", "prior_high", atr=2.0, ts_ms=1)
+        zs._add_zone(95.0, "support", "round", atr=2.0, ts_ms=1)
+        rows = zs.report(price=100.0)
+        assert rows[0]["level"] == 98.0 and rows[0]["side"] == "demand"
+        assert rows[0]["dist_pct"] == pytest.approx(-2.0)
+        assert any(r["side"] == "supply" and r["level"] == 103.0 for r in rows)
+        # sorted by absolute distance
+        assert abs(rows[0]["dist_pct"]) <= abs(rows[-1]["dist_pct"])

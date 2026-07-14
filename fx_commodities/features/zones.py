@@ -27,7 +27,8 @@ class Zone:
     created_ts_ms: int
     strength: float = 1.0
     holds: int = 0             # confirmed defences so far
-    broken: bool = False
+    flips: int = 0             # role reversals (break → other side)
+    broken: bool = False       # retired — set after the SECOND flip (whipsaw)
 
     def intersects(self, low: float, high: float) -> bool:
         return low <= self.hi and high >= self.lo
@@ -142,3 +143,23 @@ class ZoneSet:
     def active(self, kind: str | None = None) -> list[Zone]:
         return [z for z in self.zones
                 if not z.broken and (kind is None or z.kind == kind)]
+
+    def report(self, price: float, max_levels: int = 8) -> list[dict]:
+        """Supply/demand level table around the current price — the
+        'levels dashboard' view: side, level, sources, distance in %.
+        Demand = active supports below price; supply = resistances above."""
+        rows = []
+        for z in self.active():
+            is_demand = z.kind == KIND_SUPPORT
+            if (is_demand and z.center < price) or \
+               (not is_demand and z.center > price):
+                rows.append({
+                    "side": "demand" if is_demand else "supply",
+                    "level": round(z.center, 6),
+                    "sources": z.source + (f" ×{int(z.strength)}" if z.strength > 1 else ""),
+                    "holds": z.holds,
+                    "flipped": z.flips > 0,
+                    "dist_pct": round((z.center - price) / price * 100, 3),
+                })
+        rows.sort(key=lambda r: abs(r["dist_pct"]))
+        return rows[:max_levels]

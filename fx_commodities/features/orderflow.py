@@ -44,6 +44,27 @@ def add_orderflow(bars: pd.DataFrame, slope_n: int = 20,
         d_std = df["delta"].rolling(z_window).std().replace(0, np.nan)
         df["delta_z"] = (df["delta"] - d_mean) / d_std
 
+        # delta CHANGE — bar-over-bar acceleration of aggression; a large
+        # flip (e.g. +1958 → −4292 in footprint terms) marks the moment
+        # control changes hands, often before price confirms
+        df["delta_change"] = df["delta"].diff()
+        dc_std = df["delta_change"].rolling(z_window).std().replace(0, np.nan)
+        df["delta_change_z"] = df["delta_change"] / dc_std
+        df["delta_flip"] = ((np.sign(df["delta"]) != np.sign(df["delta"].shift(1)))
+                            & (df["delta_change"].abs() > 2 * dc_std)).astype(int)
+
+    # buy-pressure %: share of aggressive buying over a rolling window —
+    # the "buy pressure 34.7%" style reading; T1 uses real signed volume,
+    # T0 falls back to up/down tick counts (named the same, tier recorded
+    # in capabilities — never imputed)
+    if "buy_ticks" in df.columns:
+        b = df["buy_ticks"].rolling(slope_n).sum()
+        s = df["sell_ticks"].rolling(slope_n).sum()
+    else:
+        b = df["up_ticks"].rolling(slope_n).sum()
+        s = df["down_ticks"].rolling(slope_n).sum()
+    df["buy_pressure_pct"] = 100.0 * b / (b + s).replace(0, np.nan)
+
     return df
 
 

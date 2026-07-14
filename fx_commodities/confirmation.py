@@ -116,10 +116,16 @@ class ZoneConfirmationGate:
             t = self._track.setdefault(id(zone), _Tracking())
 
             if self._is_violation_close(zone, bar):
-                zone.broken = True
+                # Break → role flip. The flipped zone RE-ARMS: broken support
+                # becomes live resistance, and a later touch-and-reject on it
+                # is the classic break-and-retest continuation entry, handled
+                # by this same state machine in the new direction. A second
+                # violation (whipsaw both ways) retires the zone for good.
                 zone.kind = (KIND_RESISTANCE if zone.kind == KIND_SUPPORT
-                             else KIND_SUPPORT)     # role flip
-                t.state = ConfState.FAILED
+                             else KIND_SUPPORT)
+                zone.flips += 1
+                zone.broken = zone.flips >= 2
+                self._track[id(zone)] = _Tracking()   # fresh state, new role
                 continue
 
             if t.state == ConfState.IDLE:

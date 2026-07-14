@@ -39,14 +39,41 @@ class TestConfirmationStateMachine:
             sigs = gate.on_bar_close([z], bar(ts, 99.5, 99.9, 99.2, 99.5))
             assert sigs == []
 
-    def test_violation_close_breaks_and_flips_zone(self):
+    def test_violation_close_flips_zone_and_rearms(self):
         gate = ZoneConfirmationGate(n_confirm=2, violate_frac=0.5)
         z = support_zone(99.0, 100.0)           # width 1 → violation at 98.5
         gate.on_bar_close([z], bar(1, 100.2, 100.3, 99.5, 100.2))  # touch
         sigs = gate.on_bar_close([z], bar(2, 99.4, 99.5, 98.0, 98.3))
         assert sigs == []
-        assert z.broken is True
         assert z.kind == KIND_RESISTANCE        # broken support flips role
+        assert z.flips == 1
+        assert z.broken is False                # re-armed in the new role
+
+    def test_break_and_retest_produces_continuation_entry(self):
+        """The classic pattern: support breaks, price retests the flipped
+        zone from below, gets rejected twice → SHORT continuation signal."""
+        gate = ZoneConfirmationGate(n_confirm=2, violate_frac=0.5,
+                                    min_wick_ratio=0.5)
+        z = support_zone(99.0, 100.0)
+        # break: close well below violation level (98.5)
+        gate.on_bar_close([z], bar(1, 99.6, 99.7, 98.0, 98.2))
+        assert z.kind == KIND_RESISTANCE and not z.broken
+        # retest from below: wick into the flipped zone, close back under it
+        gate.on_bar_close([z], bar(2, 98.4, 99.4, 98.2, 98.5))   # confirm 1
+        sigs = gate.on_bar_close([z], bar(3, 98.5, 98.9, 98.1, 98.3))
+        assert len(sigs) == 1
+        assert sigs[0].direction == "SHORT"
+        assert sigs[0].stop_loss > z.hi          # stop beyond the flipped zone
+
+    def test_second_violation_retires_the_zone(self):
+        gate = ZoneConfirmationGate(n_confirm=2, violate_frac=0.5)
+        z = support_zone(99.0, 100.0)
+        gate.on_bar_close([z], bar(1, 99.6, 99.7, 98.0, 98.2))   # flip #1
+        assert not z.broken
+        # now violate the resistance role: close far above hi + tol (100.5)
+        gate.on_bar_close([z], bar(2, 100.2, 101.6, 100.1, 101.5))
+        assert z.flips == 2
+        assert z.broken is True                  # whipsaw both ways → retired
 
     def test_intrazone_close_resets_confirm_count(self):
         gate = ZoneConfirmationGate(n_confirm=2, min_wick_ratio=0.0)

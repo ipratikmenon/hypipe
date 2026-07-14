@@ -493,6 +493,11 @@ has fewer columns — **never impute fake orderflow**.
   −1 down-move, inherit on unchanged), weight = 1 (tick count). This measures
   directional quote pressure, not traded volume — name it honestly, and let
   feature importance decide if it earns its place.
+- **Delta dynamics (T1):** `delta_change` (bar-over-bar Δ of aggressor
+  delta), `delta_change_z`, and `delta_flip` — sign reversal of delta with
+  magnitude > 2σ, the footprint-style "control changed hands" event that
+  often precedes the price turn. `buy_pressure_pct` — rolling share of
+  aggressive buying (T1 signed volume; T0 falls back to up/down tick counts).
 
 ### 7.2 Quote dynamics (`features/quote_dynamics.py`) — T0, new in v2
 
@@ -540,8 +545,13 @@ never a line: `Z = [center − w/2, center + w/2]` with `w = ZONE_WIDTH_ATR × A
 - **DOM walls** join the zone set on T2 symbols.
 
 Zone strength = number of independent sources within w/2 of the center + count
-of prior confirmed holds; a zone whose violation close occurs (see §9.1b) is
-marked broken and flips role (broken support → resistance candidate).
+of prior confirmed holds. A violation close (see §9.1b) flips the zone's role
+and **re-arms it**: broken support becomes live resistance, so a later
+touch-and-reject on the flipped zone is the classic **break-and-retest
+continuation entry**, handled by the same confirmation state machine in the
+new direction. A second violation (whipsaw both ways) retires the zone.
+`ZoneSet.report(price)` renders the supply/demand level table (side, level,
+sources, holds, flipped, distance %) for the daily report and dashboard.
 
 ### 7.7 Large-participant footprints (`features/footprints.py`) — T1/T2
 
